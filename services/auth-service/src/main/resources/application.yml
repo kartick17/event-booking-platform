@@ -4,6 +4,33 @@ server:
 spring:
   application:
     name: auth-service
+  datasource:
+    url: jdbc:postgresql://localhost:5432/auth_db
+    username: ebp
+    password: ebp_password
+    hikari:
+      maximum-pool-size: 10
+      minimum-idle: 2
+      connection-timeout: 30000
+      pool-name: auth-pool
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+    properties:
+      hibernate:
+        format_sql: true
+
+  flyway:
+    enabled: true
+    baseline-on-migrate: true
+
+jwt:
+  secret: ${JWT_SECRET:ZmFrZS1kZXYtc2VjcmV0LWNoYW5nZS1tZS0zMi1ieXRlcy1taW5pbXVtLWxlbmd0aA==}
+  issuer: auth-service
+  access-token-ttl: PT15M
+  refresh-token-ttl: P7D
 
 eureka:
   client:
@@ -18,3 +45,11 @@ management:
     web:
       exposure:
         include: health,info
+
+logging:
+  file:
+    name: logs/${spring.application.name}.log
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 7

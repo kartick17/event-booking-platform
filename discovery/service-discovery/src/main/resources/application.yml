@@ -21,3 +21,11 @@ eureka:
     enable-self-preservation: false
     eviction-interval-timer-in-ms: 5000
     response-cache-update-interval-ms: 5000
+
+logging:
+  file:
+    name: logs/${spring.application.name}.log
+  logback:
+    rollingpolicy:
+      max-file-size: 10MB
+      max-history: 7
