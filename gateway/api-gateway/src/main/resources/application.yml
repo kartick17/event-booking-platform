@@ -4,6 +4,10 @@ server:
 spring:
   application:
     name: api-gateway
+  data:
+    redis:
+      host: localhost
+      port: 6379
 
   cloud:
     gateway:
@@ -12,6 +16,23 @@ spring:
           uri: lb://auth-service
           predicates:
             - Path=/api/v1/auth/**
+          filters:
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 5
+                redis-rate-limiter.burstCapacity: 10
+                redis-rate-limiter.requestedTokens: 1
+                key-resolver: "#{@userOrIpKeyResolver}"
+        - id: event-service
+          uri: lb://event-service
+          predicates:
+            - Path=/api/v1/events/**
+
+        - id: booking-service
+          uri: lb://booking-service
+          predicates:
+            - Path=/api/v1/bookings/**
+
       globalcors:
         cors-configurations:
           '[/**]':
