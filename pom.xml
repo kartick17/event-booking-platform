@@ -28,6 +28,7 @@
         <module>discovery/service-discovery</module>
         <module>services/auth-service</module>
         <module>gateway/api-gateway</module>
+        <module>services/event-service</module>
     </modules>
 
     <dependencyManagement>
