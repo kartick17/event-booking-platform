@@ -3,10 +3,12 @@ package com.eventbooking.event.domain;
 import com.eventbooking.event.exception.InsufficientSeatsException;
 import com.eventbooking.event.exception.InvalidEventStateException;
 import jakarta.persistence.*;
+import lombok.Getter;
 
 import java.time.Instant;
 
 @Entity
+@Getter
 @Table(name = "events")
 public class Event {
 

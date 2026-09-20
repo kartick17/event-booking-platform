@@ -91,7 +91,7 @@ public class GlobalExceptionHandler {
         log.error("Unhandled exception on {}", request.getRequestURI(), ex);
 
         return ResponseEntity.status(HttpStatus.INTERNAL_SERVER_ERROR).body(
-                ApiError.of(500, "Internal Server Error",
+                ApiError.of(500, "Internal Server Error.",
                         "Something went wrong. Please try again.", request.getRequestURI())
         );
     }
