@@ -22,6 +22,27 @@ spring:
   flyway:
     enabled: true
 
+  cache:
+    redis:
+      time-to-live: 5m
+
+  data:
+    redis:
+      host: ${REDIS_HOST:localhost}
+      port: ${REDIS_PORT:6379}
+      timeout: 2000ms
+      connect-timeout: 2000ms
+      lettuce:
+        pool:
+          max-active: 8
+          max-idle: 8
+          min-idle: 2
+
+#cache:
+#  events:
+#    ttl: PT10M
+#    list-ttl: PT60S
+
 eureka:
   client:
     service-url:
