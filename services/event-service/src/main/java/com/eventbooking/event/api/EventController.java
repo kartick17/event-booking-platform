@@ -29,13 +29,13 @@ public class EventController {
             Pageable pageable
     ) {
         log.info("Get all events");
-        System.out.println("hello from events");
         return PageResponse.from(eventService.listAll(pageable), EventResponse::from);
     }
 
     @GetMapping("/{id}")
     public EventResponse getOne(@PathVariable Long id) {
-        return EventResponse.from(eventService.getById(id));
+        log.info("Hello from event");
+        return eventService.getEventResponse(id);
     }
 
     @PostMapping

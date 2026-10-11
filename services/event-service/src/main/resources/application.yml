@@ -22,9 +22,9 @@ spring:
   flyway:
     enabled: true
 
-  cache:
-    redis:
-      time-to-live: 5m
+#  cache:
+#    redis:
+#      time-to-live: 5m
 
   data:
     redis:
@@ -38,10 +38,10 @@ spring:
           max-idle: 8
           min-idle: 2
 
-#cache:
-#  events:
-#    ttl: PT10M
-#    list-ttl: PT60S
+cache:
+  events:
+    ttl: PT10M
+    list-ttl: PT60S
 
 eureka:
   client:
