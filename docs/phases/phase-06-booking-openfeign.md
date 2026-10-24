@@ -4,13 +4,34 @@
 **Needs:** Phase 5 finished.
 **Pre-reading:** synchronous vs asynchronous calls; what a socket timeout actually is.
 
-This phase builds the booking service and makes it talk to event-service over HTTP. We will build the
-**naive synchronous version on purpose**, then spend the drills proving why it cannot be the final
-answer. Phases 11 and 12 replace it. Feeling the problem first is the point.
+You will build booking-service and make it call event-service over HTTP. We start with a simple version that waits for each call. It has known failure cases, which the exercises will demonstrate. Phases 11 and 12 replace those parts with a more reliable design.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase adds booking-service. It asks event-service for event details, asks it to reserve seats, then saves a booking in its own database. OpenFeign helps write those HTTP calls using a Java interface.
+
+Example: a user books 2 seats. Event-service reduces its available seats by 2. Booking-service saves the event name, agreed price, quantity, and booking reference. These are two separate saves. If the second fails, the first is not automatically undone. Understanding that problem is the main lesson of this phase.
+
+Words used in this phase:
+
+- **Synchronous call:** call another service and wait for its answer.
+- **Asynchronous message:** send work or a notification for another service to handle later, without waiting for that work to finish.
+- **Feign client:** the interface your code calls to send an HTTP request to another service.
+- **Proxy:** an object generated for you that performs work behind an interface.
+- **DTO:** a small object containing the fields sent or received.
+- **Connect / read timeout:** the waiting limit for connecting / reading a response after connecting.
+- **Interceptor:** code that adds shared details, such as headers, to outgoing requests.
+- **Snapshot:** a saved copy of values as they were when the booking was made.
+- **Compensation:** a separate action that tries to undo an earlier action, such as releasing reserved seats.
+- **Dual write:** changing two separate systems for one user action. One change can succeed while the other fails.
+
+Start with A1 and A6, then follow Step 1. First confirm that reserving and releasing seats works. After that, build booking-service using the remaining steps.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Synchronous or asynchronous — how to actually decide
 
@@ -31,24 +52,15 @@ response?**
 
 ### The cost of a synchronous call, stated plainly
 
-**Availability multiplies.** If booking-service is up 99% of the time and event-service is up 99% of the
-time, a booking endpoint that *requires* event-service is up `0.99 × 0.99 = 98%`. Chain four services
-and you are at 96%. **Every synchronous dependency makes you less available than your weakest link.**
+**Both services must be available.** In a simplified example where each is available 99% of the time and their failures are independent, the combined availability is `0.99 × 0.99 = 98%` after rounding. Four such services give about 96%. Requiring more services to answer adds more ways for a request to fail.
 
-**Latency adds.** Your 20 ms becomes 20 + 30 = 50 ms. A chain of five calls is a slow endpoint no
-single team owns.
+**Waiting times add up.** If booking-service takes 20 ms for its own work and waits another 30 ms for event-service, the request takes about 50 ms. Several calls in a row can make the user wait longer.
 
-**Failure propagates.** Event-service slows down → booking-service threads pile up waiting → booking
-runs out of threads → the gateway piles up waiting for booking → the whole platform is down because one
-service got slow. **This is a cascading failure, and slowness spreads it faster than crashes do** — a
-crash at least frees the thread.
+**Slowness can spread.** Booking-service workers wait for event-service. If enough workers are waiting, booking-service cannot serve new requests. The gateway then waits too. One slow service can therefore delay the whole request path. This is called a **cascading failure**.
 
-**Async has none of these properties.** Kafka being slow does not block the caller; the message simply
-sits in the log.
+**Messages reduce waiting for the receiving service.** Once Kafka has safely accepted a message, that service can handle it later. Sending to Kafka still has its own waiting limits and failure cases. If Kafka is slow or unavailable, reliable sending needs extra handling, introduced in Phase 11.
 
-> **Interview line:** "Use sync when you need the answer to build your response. Use async for
-> notifying that something happened. Every sync hop multiplies your failure probability and adds
-> latency — that arithmetic is the main argument for event-driven design."
+> **How to explain it:** "Use a waiting call when the response needs an immediate answer. Use messages when another service can react later. Calls add waiting time and dependencies; messages need handling for delayed work and failures."
 
 ## A2. What booking-service actually needs from event-service
 
@@ -63,20 +75,15 @@ Deliberately small:
 | `status` | must be `PUBLISHED` |
 | `availableSeats` | a fast pre-check |
 
-**Not** description, venue, capacity, `createdBy`. Concept A1 in Phase 4 — booking-service has its own
-bounded context, and "event" means something smaller here.
+Booking-service does not need the description, venue, capacity, or `createdBy`. Each service keeps the event fields needed for its own job, as explained in Phase 4.
 
-**So booking-service defines its own `EventDto` with only these fields.** It does **not** import
-event-service's `EventResponse`, even though the JSON is identical today. Sharing that class would mean
-event-service cannot add a field without a coordinated rebuild — a distributed monolith. Jackson
-ignores unknown fields, so a smaller local DTO is naturally forward-compatible.
+**Booking-service defines its own `EventDto`.** Do not import event-service's `EventResponse` class. Agree on the JSON fields instead. With unknown fields ignored, event-service can add response fields without forcing booking-service to use them.
 
-**This is the single most important habit in this phase.** Copy the shape you need; never share the
-class.
+**Keep this habit:** agree on the data format, but let each service define its own Java class for that data.
 
 ## A3. How Feign works internally
 
-You write an interface. You never write an implementation. At startup:
+You write an interface describing the HTTP calls. At startup, Feign creates an object that implements it for you. That object is a **proxy**. Calling its method sends the request:
 
 ```
 @FeignClient(name = "event-service")
@@ -107,7 +114,7 @@ call eventClient.getEvent(42)
 | `Client` | `HttpURLConnection` | No connection pooling — swap in Apache HttpClient or OkHttp |
 | `Encoder` / `Decoder` | Jackson | Rarely |
 | `ErrorDecoder` | throws `FeignException` | **Always** — map to your own domain exceptions |
-| `RequestInterceptor` | none | **Always** — propagate correlation id and identity |
+| `RequestInterceptor` | none | **Always** — pass on correlation id and identity |
 | `Retryer` | `NEVER_RETRY` | Careful — see Phase 7 |
 
 **`@HttpExchange` — the modern alternative** (the Phase 0 decision we promised to show):
@@ -121,30 +128,20 @@ public interface EventApi {
 }
 ```
 
-Backed by `RestClient`, built into Spring Framework 6, no Spring Cloud dependency. Same idea, newer
-plumbing. **We stay on Feign because you will meet it in real codebases**, but you should be able to
-say in an interview that Spring Cloud OpenFeign is feature-frozen and `@HttpExchange` is where new
-projects should start.
+`@HttpExchange` is another way to describe HTTP calls with an interface. The example uses `RestClient` from Spring Framework 6 and does not need Spring Cloud. This guide keeps Feign so you can learn the tool used in this project. The key idea is the same: call an interface method to make an HTTP request.
 
 ## A4. Timeouts — the setting that decides whether you survive
 
 Two different timeouts, and confusing them is common:
 
-- **Connect timeout** — how long to wait for the TCP connection. Fails fast when the host is down or
-  unreachable. **1–2 seconds is plenty**; a healthy connection on a LAN takes milliseconds.
-- **Read timeout** — how long to wait for the response *after* connecting. This must be based on how
-  long the call legitimately takes.
+- **Connect timeout:** how long to wait while opening the network connection. This guide uses a short limit, around **1–2 seconds**, so an unreachable service does not hold the caller for too long.
+- **Read timeout:** how long the client waits for response data after connecting. Choose a limit that fits the time allowed for the whole request.
 
-**Feign's defaults are 10 s connect and 60 s read.** Those numbers are catastrophic in a request path.
-A 60-second read timeout means one slow downstream service can hold a Tomcat thread for a minute. Two
-hundred such requests and your thread pool is gone — while the service itself is perfectly healthy.
+**Set timeouts rather than relying on defaults.** The Feign defaults described here are 10 seconds to connect and 60 seconds to read. A long read wait can keep a Tomcat worker busy for a minute. Enough waiting requests can use all workers even if booking-service itself has not crashed.
 
-**Choose read timeouts from the caller's budget, not the callee's speed.** If the gateway gives booking
-2 seconds total and booking does one downstream call plus its own work, that call gets ~1 second. A
-downstream call allowed to take longer than your own SLA is a bug regardless of how fast it usually is.
+**Start with the total time the user request is allowed to take.** If booking has 2 seconds total, its call to event-service must leave time for its own work too. Giving that call roughly 1 second may fit; giving it longer than the whole request budget does not.
 
-**And know what a timeout does *not* tell you.** When a write times out, you do **not** know whether it
-happened. The request may have completed on the other side and only the response was lost.
+**A timeout means we did not receive the answer in time.** It does not prove the other service did nothing. The other service may have saved its change before the response was lost.
 
 ```
 booking ──POST /reserve──▶ event-service
@@ -152,23 +149,17 @@ booking ──POST /reserve──▶ event-service
         ◀── (timeout) ──✗     response lost
 ```
 
-Booking sees a failure. Two seats are gone. **This ambiguity is why retries need idempotency (Phase 9)
-and why the final design uses events instead of a synchronous reserve call.**
+Booking-service sees a timeout, but 2 seats may already be reserved. Retrying could reserve 2 more. Phase 9 makes repeated requests safe; later phases make recovery from partial work more reliable.
 
 ## A5. What must travel with every hop
 
-**The correlation id.** Phase 3 built it. Without propagation, the trail stops at the service boundary
-and distributed debugging is over.
+**Forward the correlation id.** This is the request label from Phase 3. Carrying the same id to event-service lets you find both services' logs for one booking.
 
-**The user identity.** Event-service authorises from `X-User-Id` / `X-User-Roles`. A Feign call that
-does not forward them arrives unauthenticated and gets a 401 — one of the most common "it works in
-Postman but not from the other service" bugs.
+**Forward the verified user details.** Event-service reads `X-User-Id` and `X-User-Roles`. Without them, a protected operation sees no authenticated user and returns 401.
 
-Both are added once, in a `RequestInterceptor`, so no individual call can forget.
+A `RequestInterceptor` adds these headers to outgoing calls in one place, so each method does not have to repeat the code.
 
-**A caution for later:** the interceptor reads a `ThreadLocal` (`RequestContextHolder`). In an `@Async`
-method, a `CompletableFuture`, or a Kafka consumer there is no incoming request, so both values are
-empty. Same thread-local lesson as `SecurityContextHolder` in Phase 2a.
+**Later, calls may run without an incoming HTTP request.** `RequestContextHolder` keeps request data on the current thread. An `@Async` task, `CompletableFuture`, or Kafka consumer may have no such data. The interceptor must handle that case, as with the security context in Phase 2a.
 
 ## A6. The design we are about to build is wrong — and that is the plan
 
@@ -179,16 +170,11 @@ Booking a seat, done synchronously:
 2. booking-service: INSERT INTO bookings ...       (its own database)
 ```
 
-Two databases, two transactions, no atomicity. If step 2 fails after step 1 succeeded, **two seats are
-reserved for a booking that does not exist.** They can never be sold. Nobody is told.
+These changes use **two separate database transactions**. If reserving succeeds but saving the booking fails, the seats remain reserved without a booking. The booking database cannot automatically undo a change in the event database.
 
-There is no annotation that fixes this. `@Transactional` covers one database connection. There is no
-distributed transaction here — and the alternative (two-phase commit) is slow, needs a coordinator, and
-is not what modern systems use.
+`@Transactional` protects changes made through the local database transaction. It does not include an HTTP call to another service. A distributed transaction would need extra support and coordination across systems; this project uses messages and recovery actions instead.
 
-**Build it anyway.** You will break it in Drill 3, watch the seats leak, and then Phase 11 (outbox) and
-Phase 12 (saga) will be answers to a problem you have personally caused, rather than patterns you read
-about.
+**Build the simple version first.** Drill 3 shows how the booking save and the undo action can fail. After seeing that happen, the outbox in Phase 11 and saga in Phase 12 have a clear problem to solve.
 
 ---
 
@@ -248,9 +234,7 @@ security boundary), require a service-to-service credential, or put internal cal
 **Leave it exposed for now so you can call it by hand while learning — but write the note, because an
 interviewer will spot it.**
 
-Note also that reserve **evicts no cache**: seat counts flow through `EventResponse`, and Phase 5 said
-we do not cache inventory. Add `@CacheEvict` on the event key if you want display counts fresh — a good
-exercise in deciding what staleness is acceptable.
+**Reserving seats does not remove a cache entry in this example.** Cached `EventResponse` seat counts are for display only; reservation checks use the database. If you want the displayed count refreshed after reservation, the guide suggests adding `@CacheEvict` for that event. Decide how old a display count may be.
 
 ## Step 2 — The booking module
 
@@ -323,10 +307,7 @@ logging:
 **The Feign block is the important part.** `default` applies to every client; a named block overrides it
 per client. Concept A4: 1 s connect, 2 s read — nothing like the 10 s/60 s defaults.
 
-`loggerLevel: full` logs headers and bodies. Superb for learning, **never in production**: it will print
-the `Authorization` header and every payload into your logs. `basic` (method, URL, status, timing) is
-the production choice. The `logging.level` line is required too — Feign logs at DEBUG, so without it
-`loggerLevel` does nothing. A confusing pair on first meeting.
+**`loggerLevel: full` shows request and response headers and bodies.** It is useful locally, but may expose tokens such as `Authorization` in logs. Use `basic` for production logging of method, URL, status, and timing. Feign also needs the matching `logging.level` set to DEBUG for its configured logging to appear.
 
 Copy `CorrelationIdFilter`, `HeaderAuthenticationFilter`, `SecurityConfig`, `ApiError` and
 `GlobalExceptionHandler` over from event-service, changing packages. Same reasoning as before: small
@@ -388,16 +369,14 @@ CREATE INDEX idx_bookings_status ON bookings (status);
 
 **Two design points that matter more than they look:**
 
-**`event_id BIGINT` with no foreign key.** There *cannot* be one — the `events` table is in another
-database. Phase 4 said this; here you feel it. Nothing stops a booking referencing event 999 that never
-existed. **Referential integrity across services is your code's job, and the check is never atomic.**
+**`event_id BIGINT` has no foreign key.** The event row is in another database. Booking-service must check the event through the service API; its own database cannot guarantee that the referenced event exists.
 
 **`event_title` and `unit_price_cents` are copied, not looked up.** This is a **snapshot**, and it is
 deliberate:
 
 1. A booking must still render if event-service is down.
 2. If the admin renames the event or changes the price, **the booking must show what the user actually
-   agreed to.** A booking that silently changes price is a legal problem, not just a bug.
+   agreed to.** A booking that without a clear error changes price is a legal problem, not just a bug.
 
 **Denormalising across a service boundary is correct** — the opposite of what a single-database instinct
 says. The rule: copy the values that were part of the agreement; look up the values that must be
@@ -440,9 +419,7 @@ public enum BookingStatus {
 }
 ```
 
-`PENDING` and `REJECTED` are unused in this phase — a synchronous booking is `CONFIRMED` or it threw an
-exception. **They exist because Phase 12's saga needs them:** the booking is created `PENDING`, and a
-Kafka reply moves it to `CONFIRMED` or `REJECTED`.
+A successful booking in this phase ends as `CONFIRMED`; a failed request throws an exception. `PENDING` and `REJECTED` prepare for Phase 12, where a booking waits for a message before becoming confirmed or rejected.
 
 Putting them in now means no migration later, and it makes the shape of the final design visible while
 you build the temporary one.
@@ -524,10 +501,7 @@ public class Booking {
 }
 ```
 
-**`totalCents` is computed in the constructor, never accepted from the client.** If the client sent the
-total, a user could book 10 seats for 1 cent. **Never trust a client with money arithmetic** — recompute
-it server-side from values you fetched yourself. This is one of the most commonly exploited bugs in
-real e-commerce code.
+**Calculate `totalCents` in the constructor.** Do not accept the price or total chosen by the client. A user can edit a request. Use the price fetched by the server and multiply it by the requested quantity.
 
 Integer cents throughout, so `unitPriceCents * quantity` is exact. Phase 4's money rule again.
 
@@ -561,14 +535,9 @@ Integer cents throughout, so `unitPriceCents * quantity` is exact. Phase 4's mon
 
 (Add getters. No setters.)
 
-**The ownership check lives in `cancel`, inside the aggregate.** It could sit in the controller with
-`@PreAuthorize`, but here it is impossible to bypass — including from the Kafka consumer that will call
-this method in Phase 12, where there is no HTTP request and no `@PreAuthorize` to run.
+**`cancel` checks who owns the booking inside the Booking object.** That keeps the check active when the method is called from somewhere other than an HTTP controller, including a Kafka consumer in Phase 12.
 
-**This is the difference between authorization at the edge and authorization in the domain.** Coarse
-rules ("must be logged in", "must be ADMIN") belong at the edge. **Rules about *this specific object*
-belong on the object.** Getting that split right is a senior-level instinct, and the giveaway question
-is "can user A cancel user B's booking?" — a question the edge cannot answer.
+**Different checks answer different questions.** The gateway can check "is this user logged in?" or "is this an admin?" Booking code must check "does this particular booking belong to this user?" because it has the booking data.
 
 ## Step 7 — The Feign client
 
@@ -600,14 +569,9 @@ public record EventDto(
 }
 ```
 
-**`@JsonIgnoreProperties(ignoreUnknown = true)` is the line that keeps these two services independent.**
-Event-service sends twelve fields; we want six. Without this annotation, every field event-service adds
-breaks booking-service at runtime — a coupling that only shows up in production.
+**`@JsonIgnoreProperties(ignoreUnknown = true)` allows extra response fields.** Event-service may send more fields than booking-service needs. This annotation lets the local DTO read its fields and ignore the others.
 
-**`status` is a `String`, not the `EventStatus` enum.** Deliberate. If event-service adds a
-`POSTPONED` status, an enum here would throw on deserialisation and booking-service would fail on
-perfectly valid data. A string degrades gracefully: unknown status simply is not `"PUBLISHED"`, so it is
-not bookable. **Accept liberally at a service boundary.**
+**Keep `status` as a `String` at this boundary.** If event-service later returns `POSTPONED`, a local enum without that value could fail while reading the JSON. A string can be read safely; the booking rule still rejects it because it is not `"PUBLISHED"`.
 
 `isBookable()` and `hasSeats()` put the interpretation next to the data. Booking-service decides what
 event-service's data *means to it* — which is exactly what a bounded context does.
@@ -642,13 +606,9 @@ public interface EventClient {
 }
 ```
 
-**An interface with no implementation, and it works** — concept A3. `name = "event-service"` is a
-**Eureka lookup**, not a URL. Spring Cloud LoadBalancer resolves it to a live instance and round-robins
-between them. Everything Phase 1 built is being used by this one string.
+`name = "event-service"` is the service name, not a fixed URL. Spring Cloud LoadBalancer uses the Eureka list to choose an instance. The Feign-generated implementation sends the request to that address.
 
-`@PathVariable("id")` with the name spelled out: Feign does not always read parameter names from the
-class file (it depends on the `-parameters` compiler flag), and the failure is a confusing runtime
-error. **Always name them explicitly in Feign interfaces.**
+**Name Feign path variables:** use `@PathVariable("id")`. Reading a parameter name from compiled Java depends on the `-parameters` setting. Stating the name avoids errors caused by a missing parameter name.
 
 ## Step 8 — Feign configuration
 
@@ -690,18 +650,13 @@ public class FeignClientConfig {
 }
 ```
 
-**This class is not annotated `@Configuration`, on purpose.** A `@Configuration` class in a scanned
-package becomes global. Feign configuration classes are referenced from `@FeignClient(configuration =
-...)` and instantiated per client — so one client can have a different `ErrorDecoder` from another. Mark
-it `@Configuration` and you accidentally apply it to everything, including clients you add next year.
+**Do not add `@Configuration` to this class here.** If Spring finds it during normal scanning, its settings can apply to other Feign clients too. Referencing it through `@FeignClient(configuration = ...)` keeps these settings attached to the intended client.
 
 **What this fixes:** without it, the call to event-service arrives with no `X-User-Id`, the
 `HeaderAuthenticationFilter` builds no `Authentication`, and `@PreAuthorize("isAuthenticated()")`
 returns 401. Also the correlation chain would end at the boundary (concept A5).
 
-**The `instanceof` guard matters.** In a Kafka consumer or an `@Async` method there is no request, so
-`getRequestAttributes()` returns null and the naive version throws an NPE. Phase 12 calls Feign from a
-consumer, and this guard is what stops that being an incident.
+**The `instanceof` check handles calls with no HTTP request.** A Kafka consumer or `@Async` method may make `getRequestAttributes()` return null. Without the guard, the interceptor can throw a NullPointerException, also called an NPE.
 
 **Now the error decoder.** Add:
 
@@ -829,33 +784,19 @@ public class BookingService {
 
 **This method is the centrepiece of the phase. Read it as an argument, not as code.**
 
-**The pre-check is only a nicety.** `hasSeats()` reads a number that may be stale by the time
-`reserveSeats` runs. It exists to give a friendly error in the common case. **The real check is inside
-event-service's aggregate**, under its own transaction — which is why `reserveSeats` can still throw
-after the pre-check passed. *Check for the message, constrain for the truth* — Phase 2a's pattern,
-across a network this time.
+**The first seat check is only an early check.** Another booking can change the count before `reserveSeats` runs. The final decision belongs to event-service when it updates its live row. A successful `hasSeats()` check does not guarantee a later reservation.
 
-**`create` is deliberately not `@Transactional`.** If it were, the database transaction would stay open
-across two network calls — holding a connection from a pool of 10 for the entire round trip. Twenty
-concurrent bookings and the pool is exhausted. **Never hold a database transaction open across a remote
-call.** The narrow `persistConfirmed` is the transaction.
+**Do not keep the booking database transaction open while waiting for HTTP calls.** That can hold a database connection for the whole wait. With only 10 connections, enough waiting requests can leave none free. The intended transaction is the small database-only part in `persistConfirmed`.
 
-(`protected` + self-invocation means that inner `@Transactional` is actually **bypassed** here — the
-AOP trap from the filters doc. In real code, move it to a separate bean. It is left visible so you can
-spot it: this exact mistake is extremely common, and now you know how to see it.)
+**Important limitation in this example:** `create` calls `persistConfirmed` on the same object. That call skips Spring's transaction wrapper, so its inner `@Transactional` is not applied as intended. This is the **self-invocation problem**. The normal fix is to move the transactional method to a separate Spring bean. The example is left as written so you can recognise it.
 
-**The manual compensation is the punchline.** Look at what we had to write: catch, undo the remote call,
-log a disaster if the undo also fails. That is a **compensating transaction**, hand-rolled — and it has
-holes you cannot close:
+**Compensation means trying to undo an earlier action.** Here, if saving the booking fails, we call release to return the seats. If release also fails, we log the problem. This approach has limits:
 
-- If booking-service **crashes** between reserve and persist, nothing runs the compensation at all.
-- If `releaseSeats` fails, the seats are gone until a human notices.
-- If the reserve call **timed out**, we do not know whether to compensate — releasing seats that were
-  never reserved corrupts the count in the other direction (concept A4).
+- If booking-service **crashes** after reservation but before saving, the release code may never run.
+- If `releaseSeats` fails, the reserved count stays wrong until recovery succeeds or someone repairs it.
+- If the reservation call times out, we do not know whether it reserved seats. Releasing seats without knowing that can also make the count wrong.
 
-**Every one of these holes is why Phase 11 (outbox) and Phase 12 (saga) exist.** The saga makes the
-compensation *durable and retryable* instead of a `catch` block that only runs if the process is still
-alive.
+**Phases 11 and 12 address these gaps.** They save the work needed for recovery so it can survive a restart and be retried. A `catch` block alone can only help while the current process is still running.
 
 **Add the remaining methods:**
 
@@ -888,15 +829,9 @@ alive.
     }
 ```
 
-**`getForUser` throws "not found", not "forbidden", when the booking belongs to someone else.** That is
-deliberate: a 403 would confirm the reference exists, letting an attacker enumerate valid booking
-references. Same reasoning as Phase 2a's identical login error messages.
+**Return "not found" when the booking belongs to another user.** Returning "forbidden" would reveal that the reference exists. The user should only learn about their own bookings.
 
-**`cancel` has a second dual-write problem, in the opposite direction.** The booking is cancelled
-locally; if the release call fails, seats stay reserved for a booking that no longer exists. The
-`catch` swallows it because failing the cancel would be worse for the user — they would be stuck with a
-booking they cannot get rid of. **Both choices are bad, which is the signal that the design is wrong,
-not the error handling.** Phase 12 fixes it with an event that is retried until it succeeds.
+**Cancellation can also partly fail.** The local booking becomes cancelled, but the call to release seats may fail. This version logs the release failure and lets cancellation continue. The records then disagree: a cancelled booking can still hold seats. Phase 12 uses messages that can be retried to complete the release.
 
 ## Step 10 — DTOs, repository, controller
 
@@ -996,9 +931,7 @@ public class BookingController {
 }
 ```
 
-**`@PreAuthorize` on the class, not per method** — every booking endpoint needs a user, with no
-exceptions. A class-level rule cannot be forgotten when someone adds a fifth endpoint next month.
-Fail-safe by default, exactly like the gateway's allow-list.
+**Put `@PreAuthorize` on the class** because every booking endpoint needs a logged-in user. A later endpoint added to the class then inherits the same requirement.
 
 **The user id always comes from `Authentication`, never from the request.** `POST /bookings` with
 `{"userId":"someone@else.com"}` is impossible because the DTO has no such field, and the controller
@@ -1029,9 +962,7 @@ curl -s http://localhost:8080/api/v1/events/1 | jq '{availableSeats}'
 
 Seats dropped by 2. **Two services, two databases, one user action.**
 
-**Watch the booking-service log.** With `loggerLevel: full` you see the outgoing request, the forwarded
-`X-Correlation-Id` and `X-User-Id`, and the response. Then grep that correlation id in the event-service
-log: **one id, three processes.** Phase 3's work paying off.
+**Follow one booking through the logs.** Local `loggerLevel: full` output shows the call and forwarded `X-Correlation-Id` and `X-User-Id`. Search event-service's logs for that same correlation id to connect the work across services.
 
 ### The full request flow
 
@@ -1073,7 +1004,7 @@ time curl -i -X POST http://localhost:8080/api/v1/bookings \
 Fails in about **1 second** — the connect timeout. Now set `connectTimeout: 10000`, restart, and try
 again: 10 seconds of a held Tomcat thread.
 
-**That difference is the entire argument of Phase 7.** Multiply by 200 concurrent requests and the first
+**That difference is the entire argument of Phase 7.** Multiply by 200 happening at the same time requests and the first
 number is a blip while the second is an outage.
 
 Note the response is a 500. It should be a **503 Service Unavailable** with `Retry-After` — a downstream
@@ -1083,10 +1014,7 @@ outage is not an internal server error. Add that mapping to your `GlobalExceptio
 
 Add a `Thread.sleep(5000)` to event-service's `getById` and restart.
 
-The booking now fails after 2 seconds with a read timeout. **Slow is worse than down**: a dead service
-refuses connections instantly, while a slow one holds your threads for the full timeout. This is why
-timeouts are not optional and why bulkheads (Phase 7) exist — so one slow dependency cannot consume
-every thread you have.
+The call reaches the 2-second read timeout. A slow service holds a worker until that limit; a stopped service may refuse a connection immediately. Phase 7 adds limits on how many workers one dependency can keep waiting.
 
 Remove the sleep.
 
@@ -1114,9 +1042,7 @@ ERROR COMPENSATION FAILED - 2 seats leaked on event 1. Manual fix required.
 
 **Two seats can never be sold again. No user, no admin, no process will ever fix it.**
 
-Sit with that for a minute. This is a *correct-looking* piece of code, with error handling, that
-permanently corrupts inventory. The `catch` block only runs if the process survives — and processes do
-not survive crashes, OOM kills, or a deploy at the wrong moment.
+The code has error handling, but still leaves reserved seats with no booking. The reason is that recovery code cannot run after the process has stopped. A crash, lack of memory, or a restart between the two saves can leave partial work behind.
 
 **This is the exact problem Phases 11 and 12 solve.** Not with better `try/catch`, but by making the
 undo a durable, retried message instead of an in-memory instruction that dies with the process.
@@ -1144,10 +1070,7 @@ docker exec -it ebp-postgres psql -U ebp -d event_db \
   -c "SELECT available_seats FROM events WHERE id = 1;"
 ```
 
-You will likely see **one 201 and four 409s**, and `available_seats = 0`. Correct — but *why* is it
-correct? Not because of your pre-check, which every one of those five requests passed. Because
-event-service's `reserveSeats` runs inside a transaction on a single row, and `@Version` from Phase 4 is
-quietly rejecting the losers.
+You will likely see **one 201 and four 409s**, with `available_seats = 0`. Several requests may have passed the first check. The protection comes from event-service's row update and `@Version`, which rejects a change based on an older row version.
 
 **Run it several times.** Under the right timing you may see an `OptimisticLockException` surface as a
 500 rather than a clean 409. **Phase 8 is about making that behaviour deliberate and correct instead of
@@ -1160,10 +1083,10 @@ accidental.**
 | Mistake | Symptom | Fix |
 |---|---|---|
 | Sharing a DTO class between services | Deploy coupling; a distributed monolith | Copy the shape you need |
-| Default Feign timeouts (10 s / 60 s) | Thread pool exhaustion under load | 1–2 s connect, ≤3 s read |
+| Default Feign timeouts (10 s / 60 s) | Thread pool running out under load | 1–2 s connect, ≤3 s read |
 | No `ErrorDecoder` | HTTP status codes leak into domain logic | Map to domain exceptions |
-| No `RequestInterceptor` | 401s between services; broken tracing | Propagate the headers |
-| `@Transactional` around a remote call | Connection pool exhausted | Narrow the transaction |
+| No `RequestInterceptor` | 401s between services; broken tracing | Pass on the headers |
+| `@Transactional` around a remote call | Connection pool used up | Narrow the transaction |
 | Feign config class marked `@Configuration` | Applied to every client | Leave it unannotated |
 | Retrying 4xx | Same failure, more load | Retry 5xx and timeouts only |
 | Trusting a client-supplied total | Users book for 1 cent | Recompute server-side |
@@ -1174,21 +1097,17 @@ accidental.**
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Swap the default Feign client** for Apache HttpClient 5 or OkHttp — the default has no connection
-  pooling, so every call opens a new TCP connection.
-- **Circuit breaker on every Feign client** (Phase 7). Without it, one sick dependency takes you down.
-- **`loggerLevel: basic` in production.** `full` prints tokens and bodies.
-- **Return 503 with `Retry-After`** for downstream outages, not 500.
-- **Never `@Transactional` across a remote call.**
-- **Consider a service-to-service credential** so internal endpoints are not callable by end users
-  (step 1's note).
-- **Budget your timeouts top-down:** gateway 5 s → booking 3 s → event 1 s. A downstream timeout larger
-  than your own is meaningless.
-- **Watch for chatty calls.** One booking making five Feign calls is a design problem; batch or
-  denormalise instead.
-- **Contract tests** (Phase 13) so event-service cannot break booking-service without a failing build.
+- **Use an HTTP client with connection pooling**, such as Apache HttpClient 5 or OkHttp, when appropriate. Pooling reuses connections instead of opening a new one for every call.
+- **Add circuit breakers in Phase 7** so repeated dependency failures do not keep every caller waiting.
+- **Use `loggerLevel: basic` in production.** `full` can expose tokens and request data.
+- **Return 503 with `Retry-After`** when the dependency is unavailable, rather than an unexplained 500.
+- **Keep database transactions separate from remote calls** so waiting does not hold database connections unnecessarily.
+- **Protect internal endpoints with service credentials or routing controls**, as noted in Step 1. Ordinary users must not be able to reserve seats without creating a booking.
+- **Fit inner timeouts inside the outer request budget:** for example, gateway 5 seconds, booking 3 seconds, event 1 second.
+- **Avoid too many calls per booking.** Combine needed reads or keep suitable copies of data where that reduces waiting safely.
+- **Add contract tests in Phase 13** to catch response changes that would break booking-service.
 
 ---
 
@@ -1213,9 +1132,7 @@ accidental.**
 You now have a booking service whose availability is multiplied by event-service's, that holds threads
 while waiting, and that falls over when its dependency gets slow.
 
-Next: **Resilience4j.** Timeout, retry with exponential backoff and jitter, circuit breaker, fallback,
-bulkhead and rate limiter — and, more importantly, when each is the wrong tool. Retrying a broken
-service is how you turn a small outage into a large one.
+Next is **Resilience4j**. You will limit waits, decide when to retry, pause calls to failing services, and limit the workers one dependency can use. These tools reduce the effect of a failure, but careless retries can add more load.
 
 **Pre-reading for Phase 7:** cascading failure, and the thread-pool-exhaustion story behind circuit
 breakers.

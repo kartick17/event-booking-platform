@@ -4,16 +4,38 @@
 **Needs:** Phase 3 finished (gateway routing and stripping headers).
 **Pre-reading:** bounded context; why entities must not leak out of a controller.
 
-This is the first service that is purely business. It is also where you learn to design a service
-whose rules cannot be broken from outside — which is what makes Phase 8's concurrency work possible.
+This is the first service for the booking business itself. You will build event features and put their rules in one place. That prepares you for Phase 8, where several users try to change the same seats at once.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase builds the event catalogue: creating an event, publishing it, showing it to users, and cancelling it. It also decides where the rules about seats and event status belong.
+
+For example, an event starts as a draft. An admin publishes it. Users can then browse it. Once cancelled, it must not accept new reservations. We put those rules inside the Event object so every caller uses the same checks.
+
+Words used in this phase:
+
+- **Domain / business rules:** the subject of the application and its rules, such as "seats cannot be negative."
+- **Bounded context:** one area with its own meaning of the data. Event-service owns event details; booking-service owns bookings.
+- **Entity:** an object with a lasting identity, such as event 42 even after its title changes.
+- **Aggregate root:** the main object through which related data is changed and checked. Here, it is Event.
+- **Invariant:** a rule that must always hold.
+- **State transition:** a change from one status to another, such as DRAFT to PUBLISHED.
+- **DTO:** a data transfer object; the fields sent in a request or response.
+- **Repository:** code used to load and save database records.
+- **Transaction:** a group of database changes that succeed or roll back together.
+- **Pagination:** returning a small page of results instead of every record at once.
+
+Start with the event statuses and seat rules. They explain why the classes and database checks in the build steps are needed.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Bounded context — the idea the whole architecture rests on
 
-A **bounded context** is a boundary inside which words mean exactly one thing.
+A **bounded context** is an area of the application with its own data and rules. Within that area, a word such as "event" has a clear meaning.
 
 Take the word "event":
 
@@ -21,17 +43,11 @@ Take the word "event":
 - To **booking-service**, an "event" is barely more than an id and a price.
 - To a marketing service, it would be a campaign target with an audience segment.
 
-**One word, three meanings.** The classic mistake is to build one giant shared `Event` class that
-serves all three. It ends up with 40 fields, every team must agree before changing it, and nobody can
-deploy alone. That is a distributed monolith wearing microservice clothes.
+Each service needs a different view of an event. One large shared `Event` class would collect fields for all of them. Then changing it could force several services to change and be released together. This is called a **distributed monolith**.
 
-The fix: **each context owns its own model.** Booking-service keeps `eventId` and its own snapshot of
-what it needs. When contexts must exchange data, they exchange a **contract** (a DTO or an event
-schema), not a class.
+**Give each service its own model.** Booking-service keeps `eventId` and copies the details it needs. Services agree on the fields they exchange, called a **contract**, rather than importing each other's internal Java classes.
 
-> **Interview definition:** "A bounded context is the boundary within which a model is valid. Two
-> contexts can use the same word for different things, and that's fine — what crosses the boundary is a
-> contract, never a shared domain class."
+> **How to explain it:** "Each service owns its view of the data. Event-service needs the venue and capacity; booking-service needs the event id and agreed price. They exchange data using an agreed format."
 
 ### Domain, subdomain, context
 
@@ -49,25 +65,20 @@ You have drawn the line in the wrong place if:
 - Two services keep the same data and must agree instantly.
 - One service is only ever a thin proxy over another.
 
-**Our boundaries:** auth owns identity, event owns catalogue **and seat capacity**, booking owns
-bookings. Seat capacity living in event-service is the decision that makes everything else work — one
-owner of the number means no distributed lock is needed to change it.
+**Our ownership rules:** auth-service owns users and login, event-service owns the catalogue and seat counts, and booking-service owns bookings. Only event-service changes seat counts. That gives the database one clear place to protect those changes.
 
 ## A2. Aggregate and aggregate root
 
-An **aggregate** is a cluster of objects treated as one unit for changes. The **aggregate root** is the
-one object outside code is allowed to touch.
+An **aggregate** is related data changed as one unit. The **aggregate root** is the main object that other code uses to make those changes. It checks the rules before allowing a change.
 
-Our `Event` is an aggregate root, and its invariants — the rules that must *always* hold — are:
+Here, `Event` is the aggregate root. Its **invariants**, meaning rules that must always hold, are:
 
 1. `availableSeats` is never negative.
 2. `availableSeats` never exceeds `capacity`.
 3. A `CANCELLED` event never accepts a reservation.
 4. Status changes follow the allowed transitions.
 
-**Why this matters practically:** if these rules live in a service class, every new caller must
-remember them, and one that forgets creates corrupt data that outlives the bug. If they live *inside
-the entity*, breaking them is impossible without editing the entity.
+Put these checks inside the Event object. Otherwise, every caller must remember to check them separately, and a forgotten check could save bad data. A method such as `reserveSeats` checks the rules before changing the count.
 
 ```java
 // Rules live outside the object — every caller must remember them
@@ -79,30 +90,23 @@ if (event.getAvailableSeats() >= qty && event.getStatus() == PUBLISHED) {
 event.reserveSeats(qty);   // throws if it would break an invariant
 ```
 
-The second version is the aggregate root doing its job. **No setters on the entity** is not style
-preference — it is what makes the guarantee real.
+In the second version, callers ask the object to reserve seats instead of assigning a number directly. **Avoiding public setters** helps keep callers from skipping those checks.
 
-> **Interview definition:** "An aggregate is a consistency boundary. Everything inside it is updated in
-> one transaction and its invariants always hold; things outside reference it by id only."
+> **How to explain it:** "The aggregate groups data that must stay correct together. Its main object checks the rules, and changes are saved in one transaction. Other parts of the application refer to it by id."
 
 ### One aggregate, one transaction
 
-The rule of thumb: **one transaction changes one aggregate.** If you find yourself needing to change
-two aggregates atomically, either they are really one aggregate, or you need eventual consistency
-between them — which is exactly the Saga in Phase 12.
+**A useful starting rule:** change one aggregate in a transaction. If a workflow must change data in different services, those changes cannot use one ordinary database transaction. Phase 12 uses a saga to coordinate separate changes.
 
-Here, `Event` and `Booking` live in different services and different databases. They *cannot* be
-changed in one transaction. That constraint is not an inconvenience; it is the reason the rest of this
-project exists.
+`Event` and `Booking` are stored in separate services and databases. Saving one does not automatically save or undo the other. Later phases teach how to handle that gap.
 
 ## A3. State machines beat boolean flags
 
 Our event status: `DRAFT → PUBLISHED → CANCELLED / COMPLETED`.
 
-The lazy version is a few booleans — `isPublished`, `isCancelled`, `isCompleted`. Then someone sets two
-of them and you have an event that is both published and cancelled, and no code knows what that means.
+Separate boolean fields can allow confusing combinations, such as `isPublished` and `isCancelled` both being true. One status field makes the current state clearer.
 
-An **enum plus explicit allowed transitions** makes the invalid states unrepresentable:
+Use **one enum for the status** and list the allowed changes. Then reject any status change that is not listed:
 
 ```
 DRAFT ──publish──▶ PUBLISHED ──complete──▶ COMPLETED
@@ -110,8 +114,7 @@ DRAFT ──publish──▶ PUBLISHED ──complete──▶ COMPLETED
   └──cancel──▶ CANCELLED ◀──cancel──┘
 ```
 
-`COMPLETED → PUBLISHED` is not on the diagram, so it cannot happen. Encode the arrows in code and every
-caller inherits the rule for free.
+The diagram has no arrow from `COMPLETED` to `PUBLISHED`. The code should reject that change, so every caller follows the same rule.
 
 ## A4. API contracts and backward compatibility
 
@@ -131,11 +134,9 @@ Your API is a **promise**. Once a client depends on it, breaking it breaks them.
   loudly
 - adding an enum value old clients *will* receive and cannot parse
 
-**The rule: additive changes only.** When you genuinely must break something, that is `/api/v2/`, run
-side by side, with a migration window and a deprecation notice.
+**Keep existing clients working.** Prefer changes that add optional data. If an incompatible change is necessary, introduce `/api/v2/` alongside the old API and give clients time to move.
 
-**Pagination is part of this.** `GET /api/v1/events` returning every row works with 50 events and takes
-your service down with 500,000. Paginate from the first day — retrofitting it is a breaking change.
+**Add pagination from the start.** Returning all events may work for 50 records but consume too much memory for 500,000. Changing an existing list response to pages later can break clients.
 
 ## A5. Trusting the gateway's headers
 
@@ -157,9 +158,7 @@ event-service
              → @PreAuthorize("hasRole('ADMIN')") works exactly as before
 ```
 
-**Say the trade-off out loud, because an interviewer will ask:** this is safe only while services are
-unreachable from outside the cluster. The moment event-service is exposed, anyone can send
-`X-User-Roles: ROLE_ADMIN`. In production: private subnets, security groups, or mTLS in a service mesh.
+**Important limit:** trusting user headers is safe only when outside callers cannot reach event-service directly. Otherwise anyone can send `X-User-Roles: ROLE_ADMIN`. Production needs network protection such as private subnets, security groups, or authenticated service connections using mTLS.
 
 ---
 
@@ -333,28 +332,16 @@ CREATE INDEX idx_events_created_by ON events (created_by);
 
 **Five decisions worth defending:**
 
-**`price_cents BIGINT`, never a floating-point type for money.** `0.1 + 0.2 != 0.3` in binary floating
-point. Store the smallest unit as an integer, format for display at the edge. This is one of the most
-common real-world bugs in junior code. (`NUMERIC(19,4)` is the other correct answer; integers are
-simpler and faster.)
+**Store money in integer units, such as `price_cents BIGINT`.** Binary floating-point numbers can introduce rounding differences, as in `0.1 + 0.2 != 0.3`. Format the integer for display in the response or client. A fixed decimal type such as `NUMERIC(19,4)` is another option.
 
-**`CHECK` constraints.** The same rules live in the entity — so why here too? Because the entity
-protects *your application*, and the constraint protects *the data*. A bad migration, a manual
-`UPDATE` in psql, or a second application would all sail past your Java rules. `available_seats >= 0`
-enforced by Postgres means negative seats are impossible, full stop.
+**Database `CHECK` constraints protect saved data.** Java checks protect calls through your application. A manual SQL update or another application can skip those Java checks. A database rule such as `available_seats >= 0` also rejects those invalid writes.
 
 **`version BIGINT`** — the optimistic locking column. Nothing uses it yet; Phase 8 does. Adding it now
 means no migration later, and the cost is one column.
 
-**`created_by VARCHAR(255)` holding an email, not a foreign key to a `users` table.** There is no users
-table in this database and there must never be one — that data belongs to auth-service. **This is
-database-per-service in practice: cross-service references are plain values, never foreign keys.**
-Losing referential integrity across services is a real cost of microservices, and it is paid on
-purpose.
+**`created_by VARCHAR(255)` stores an email.** The users table belongs to auth-service, not this database. We therefore cannot use a normal foreign key to that table. The application must check cross-service references when needed.
 
-**`idx_events_status_starts_at`** — a composite index for the main query, "published events, soonest
-first". Column order matters: an index on `(status, starts_at)` also serves a query filtering on
-`status` alone, but *not* one filtering on `starts_at` alone. Leftmost-prefix rule.
+**`idx_events_status_starts_at` is an index on two columns.** It helps find events with a chosen status and return them by start time. The column order matters: `(status, starts_at)` is especially useful when the query filters by `status`, the first column. It is not generally the right index for a query only filtering by `starts_at`.
 
 ## Step 5 — The status enum with transitions
 
@@ -391,13 +378,9 @@ public enum EventStatus {
 }
 ```
 
-**The state machine from concept A3, in code.** `CANCELLED` and `COMPLETED` are terminal — nothing
-leads out of them. That single fact prevents a whole family of bugs where a cancelled event quietly
-comes back to life.
+**These are the status rules from A3.** `CANCELLED` and `COMPLETED` are final states: there are no allowed changes out of them. This prevents a cancelled event from becoming active again accidentally.
 
-`acceptsBookings()` gives the rule a name. Callers write `if (status.acceptsBookings())` instead of
-`if (status == PUBLISHED)`. When the rule changes — say `LAST_MINUTE` also accepts bookings — you edit
-one method rather than hunting for comparisons.
+`acceptsBookings()` names the rule clearly. Callers use `if (status.acceptsBookings())` rather than repeating `if (status == PUBLISHED)`. If a later `LAST_MINUTE` status also accepts bookings, change this rule in one place.
 
 The `switch` is exhaustive over the enum, so **adding a new status makes the code fail to compile**
 until you decide its transitions. The compiler becomes a checklist.
@@ -466,14 +449,9 @@ public class Event {
 }
 ```
 
-**`@Enumerated(EnumType.STRING)`, never `ORDINAL`.** Ordinal stores the enum's *position* — `DRAFT` is
-0, `PUBLISHED` is 1. Insert a new value in the middle of the enum later and every existing row silently
-means something different. That is a data-corruption bug with no error message. Always `STRING`.
+**Use `@Enumerated(EnumType.STRING)` to store enum names.** `ORDINAL` stores positions such as 0 and 1. Adding a value in the middle later can change what existing positions mean. Storing names avoids that problem.
 
-**`@Version`** maps to the column from V1. Hibernate now manages it: every update includes
-`WHERE version = ?` and increments it. Two concurrent updates → the second fails with
-`OptimisticLockException`. **It is already on**, quietly protecting you. Phase 8 makes it explicit and
-tests it under real concurrency.
+**`@Version` detects competing updates.** Hibernate checks `WHERE version = ?` when updating and increases the version. If another transaction already changed the row, the update fails with `OptimisticLockException`. Phase 8 explores and handles this conflict.
 
 **Now the constructor and the business methods.** Add:
 
@@ -566,18 +544,11 @@ One private method holds the rule; three public methods give it business names. 
 
 **Read `reserveSeats` slowly — this method is why the architecture looks the way it does.**
 
-Every invariant from concept A2 is checked here, inside the aggregate. There is no way to reserve seats
-on a cancelled event, no way to go negative, no way to over-release beyond capacity. **No caller can
-get it wrong, because no caller can reach the field.**
+These methods check the rules from A2 before changing seats. They reject reservations on cancelled events and prevent counts below zero or above capacity. Callers use these methods instead of changing the field directly.
 
-In Phase 12 this exact method is called from a **Kafka consumer** rather than a controller. Because the
-rules live in the entity and not in an HTTP layer, that will require no changes at all. That is the
-payoff of putting logic in the domain — and a concrete answer to "why bother with DDD?"
+In Phase 12, a **Kafka consumer** calls this method after receiving a message. The seat rules stay the same because they belong to the Event object, rather than only to the HTTP controller.
 
-`releaseSeats` uses `Math.min(capacity, ...)` rather than throwing on overflow. Deliberate: releases
-come from cancellations, and in a distributed system a cancellation message can arrive **twice**
-(Phase 10). Clamping makes a duplicate release harmless instead of corrupting data. That is
-**idempotent thinking**, and Phase 9 is built on it.
+`releaseSeats` uses `Math.min(capacity, ...)` to stop the total exceeding capacity. This is a defensive limit, but **it does not make duplicate releases fully safe**: a repeated release could still increase the count incorrectly below that limit. Phase 9 adds duplicate protection so the same cancellation is not applied twice.
 
 **Then the updates and getters:**
 
@@ -607,10 +578,7 @@ come from cancellations, and in a distributed system a cancellation message can 
 
 (Add plain getters for every field. **No setters** — that is the whole design.)
 
-**Capacity is deliberately not editable.** Lowering it below the seats already sold would create an
-event that is oversold, and there is no sensible automatic answer to that. Leaving it out of
-`updateDetails` means the question never arises. When the business asks for it, it needs its own method
-with its own rules — and that conversation is the right one to have.
+**Capacity cannot be edited in this version.** Reducing it below seats already sold would need a separate business decision. If that feature is added later, give it its own method and checks rather than adding it to `updateDetails`.
 
 `bookedSeats()` and `isSoldOut()` are **derived** values, not stored columns. Storing them would mean
 two sources of truth that can drift apart. Compute what you can derive.
@@ -673,9 +641,7 @@ public class InsufficientSeatsException extends RuntimeException {
 }
 ```
 
-**This one carries structured data, not just a message string.** In Phase 12 a Kafka consumer catches
-it and must publish a `SeatsRejected` event containing the numbers. Parsing them back out of a message
-string would be miserable. **Exceptions crossing a service boundary should carry fields.**
+**This exception carries numbers as fields, as well as a message.** Phase 12 needs those numbers to publish a `SeatsRejected` message. Keeping fields avoids trying to recover numbers from a sentence in an error message.
 
 ## Step 8 — Repository
 
@@ -707,9 +673,7 @@ one.
 Both methods are backed by the composite index from V1. The second one matches
 `(status, starts_at)` exactly — that is not a coincidence; **design the index and the query together.**
 
-**A caution worth knowing now:** `OFFSET` pagination gets slower the deeper you page, because the
-database still walks the skipped rows. Page 5000 is genuinely slow. The fix is **keyset pagination**
-(`WHERE starts_at > :last ORDER BY starts_at LIMIT 20`). Overkill here, essential at scale.
+**`OFFSET` skips earlier rows before returning a page.** Large page numbers mean more rows to skip. **Keyset pagination** starts after the last value already seen, for example `WHERE starts_at > :last ORDER BY starts_at LIMIT 20`. We do not need that extra design here, but it helps with deep lists.
 
 ## Step 9 — DTOs
 
@@ -745,15 +709,9 @@ public record CreateEventRequest(
 }
 ```
 
-**No `status` and no `createdBy` field.** Both are decided by the server: status starts as `DRAFT`,
-`createdBy` comes from the authenticated identity. Accepting them from the client would let anyone
-create an event owned by someone else, or spawn one straight into `PUBLISHED`. **A request DTO should
-contain only what the client is genuinely allowed to decide** — this is the mass-assignment lesson from
-Phase 2a applied to a second service.
+**Do not accept `status` or `createdBy` from the client.** A new event starts as `DRAFT`, and its creator comes from the authenticated user. Letting callers choose those fields could create published events or events owned by someone else. Request DTOs should contain only fields the user may decide.
 
-`@Future` on `startsAt` duplicates the constructor's check. Not waste — different jobs. Validation
-gives a friendly 400 with a field name; the constructor guarantees no `Event` object can ever be
-invalid, including when built by a Kafka consumer that never saw an HTTP request.
+`@Future` checks `startsAt` at the API boundary and can return a helpful 400 response. The constructor also checks the rule so non-HTTP callers, such as a Kafka consumer, cannot skip it.
 
 `@Max(100_000)` on capacity: without an upper bound, someone sends `Integer.MAX_VALUE` and your
 arithmetic overflows. Bound every numeric input.
@@ -792,9 +750,7 @@ public record EventResponse(
 }
 ```
 
-**No `version` and no `createdBy` in the response.** `version` is an internal locking detail — exposing
-it invites clients to depend on it. `createdBy` is another user's email; leaking it to every browser is
-a small privacy hole with no upside.
+**Leave `version` and `createdBy` out of the response.** The version is an internal locking detail. The creator value is another user's email, which ordinary event browsing does not need.
 
 `bookedSeats` and `soldOut` are computed. The client should not have to do arithmetic to render a
 "Sold out" badge, and if it did, two clients would eventually compute it differently.
@@ -829,10 +785,7 @@ public record PageResponse<T>(
 }
 ```
 
-**Why not just return Spring's `Page`?** Because its JSON shape is an internal framework detail that
-has changed between Spring versions, includes a confusing nested `pageable` object, and even logs a
-warning about serialising it directly. Your API contract must not move when you upgrade a library. Six
-fields you control beats forty you do not.
+**Use a response shape you control.** Spring's `Page` contains framework-specific details and its JSON can change after an upgrade. A small response DTO gives clients a stable set of fields.
 
 ## Step 10 — The application service
 
@@ -886,13 +839,9 @@ public class EventService {
 }
 ```
 
-**Notice how thin this is.** All the rules are in the constructor; the service only orchestrates. That
-is the correct split — **the application layer coordinates, the domain layer decides.** A fat service
-class with an anaemic entity is the most common way people get this backwards.
+**The service coordinates the work; the Event object checks the business rules.** Here, the constructor handles the event rules, so the service does not need to repeat them.
 
-`createdBy` is a **parameter**, not read from `SecurityContextHolder` here. The application layer stays
-independent of how identity arrived. The controller reads the context and passes it in — so this same
-method works unchanged from a Kafka consumer or a scheduled job.
+Pass `createdBy` into the service method. Let the controller read the authenticated user. The service then does not depend on how the request arrived and can also be called from a message handler or scheduled job.
 
 **Reads:**
 
@@ -953,15 +902,9 @@ accidentally leak drafts.
     }
 ```
 
-**No `eventRepository.save(...)` in any of them.** Inside `@Transactional`, entities loaded through the
-repository are **managed**. At commit, Hibernate compares each one to its loaded snapshot and issues an
-`UPDATE` for whatever changed. This is **dirty checking**, and it is JPA's core trick. Calling `save()`
-would work and do nothing extra.
+**These methods do not need `eventRepository.save(...)`.** The entity was loaded inside `@Transactional`, so Hibernate tracks it. At commit, it writes the changed fields. This automatic tracking is called **dirty checking**.
 
-That is also why `@Transactional` must be on the method: outside a transaction the entity is
-*detached*, your change is applied to a Java object in memory, no SQL is issued, and the request
-returns 200 having saved nothing. **A silent no-op is the worst failure mode there is**, and this one
-catches people regularly.
+**The transaction matters.** If an object is no longer tracked by Hibernate, changing it only changes Java memory. Without a transaction or a later save, the database is not updated even if the request appears successful.
 
 `log.warn` on cancel, not `log.info` — cancelling an event with bookings has real consequences. Log
 levels are a signal to whoever reads the logs at 3am.
@@ -1031,9 +974,7 @@ inherits the result.
 `SecurityContextHolder.clearContext()` in a `finally`: Phase 2a, concept A2.4. Pooled threads must
 never carry an identity into the next request.
 
-**The trust assumption is doing enormous work here**, so state it every time you read this class: these
-headers are trustworthy **only** because the gateway strips client copies and the service is not
-reachable from outside.
+**Remember the trust rule:** these headers are reliable only when the gateway replaces client-supplied copies and outside callers cannot bypass the gateway.
 
 **File:** `.../config/SecurityConfig.java`
 
@@ -1133,7 +1074,7 @@ public class EventController {
 
 **`@PageableDefault` matters more than it looks.** Without it, a client sending `?size=1000000` makes
 your service load a million rows into memory. Spring caps page size at 2000 by default
-(`spring.data.web.pageable.max-page-size`), but setting a sensible default and knowing the cap exists
+(`spring.data.web.pageable.max-page-size`), but setting a useful default and knowing the cap exists
 is the point. **Every list endpoint needs a bound.**
 
 Spring builds the `Pageable` from `?page=0&size=20&sort=startsAt,desc` automatically.
@@ -1173,10 +1114,7 @@ Spring builds the `Pageable` from `?page=0&size=20&sort=startsAt,desc` automatic
 `HeaderAuthenticationFilter`, stored in the `ThreadLocal`, resolved into this parameter. Four
 components, one value, and you built every one of them.
 
-**`POST /{id}/publish` rather than `PATCH` with `{"status":"PUBLISHED"}`.** Publishing is an *action*
-with rules, not a field assignment. A status field invites clients to attempt any transition and forces
-your code to guess intent. An action endpoint says exactly what is happening — and matches
-`event.publish()` one-to-one.
+**Publishing is an action with rules.** `POST /{id}/publish` makes that action clear and matches `event.publish()`. A general status update such as `PATCH` with `{"status":"PUBLISHED"}` would also need to reject every forbidden status change.
 
 **No `DELETE`.** Events with bookings must never vanish; `cancel` is the real-world operation. When you
 find yourself wanting a hard delete on a business entity, ask what the business actually does — it is
@@ -1214,10 +1152,8 @@ then add the event-specific mappings:
 
 **Why 409 Conflict and not 400 Bad Request** — this distinction is worth getting right:
 
-- **400** means the request itself is malformed. Sending it again will fail identically.
-- **409** means the request is well-formed but conflicts with the **current state**. Publish an event
-  that is already cancelled: nothing wrong with the request, the state says no. The same request might
-  succeed at a different time, or after someone else's change.
+- **400:** something is wrong with the request data or format. Repeating it unchanged will not fix it.
+- **409:** the requested action conflicts with the current saved state. For example, a cancelled event cannot be published. The request format is valid, but the event's state does not allow the action.
 
 A client can act on that difference: retry-with-backoff for 409, fix-your-code for 400.
 
@@ -1375,7 +1311,7 @@ Restart Postgres and watch it come back `UP`.
 | Mistake | Symptom | Fix |
 |---|---|---|
 | Missing `@Transactional` on a write | Silent no-op, response looks correct | Annotate the method |
-| `@Enumerated(ORDINAL)` | Data silently means something else after an enum edit | Always `STRING` |
+| `@Enumerated(ORDINAL)` | Data without a clear error means something else after an enum edit | Always `STRING` |
 | `double` for money | Rounding errors in totals | `long` cents or `NUMERIC` |
 | Setters on the entity | Invariants bypassed | Behaviour methods only |
 | Entity returned from the controller | Internal fields leak; lazy-loading errors | Response DTO |
@@ -1389,20 +1325,16 @@ Restart Postgres and watch it come back `UP`.
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Soft delete / archive** instead of `DELETE`, for audit and for bookings that reference old events.
-- **Keyset pagination** for deep pages (step 8).
-- **Full-text search** for title and venue — `pg_trgm` or a search engine. `LIKE '%x%'` cannot use an
-  index.
-- **Optimistic locking is already on** via `@Version`. Phase 8 proves it under real concurrency.
-- **Outbox rows** will be written in the same transaction as event changes (Phase 11), so
-  `EventCreated` / `EventUpdated` can be published reliably.
-- **Rate limit the public list endpoint** — it is unauthenticated and the most scrapeable thing you
-  have.
-- **Money and time zones:** store `TIMESTAMPTZ`, format per user at the edge. An event at "19:00" means
-  19:00 *at the venue*.
-- **Audit trail** for admin actions on events — who published, who cancelled, when.
+- **Archive or mark events as deleted instead of using `DELETE`** when history and existing bookings still refer to them.
+- **Use keyset pagination for deep lists**, as explained in Step 8.
+- **Plan search indexes for titles and venues.** A normal index is usually unsuitable for `LIKE '%x%'`; `pg_trgm` or a search engine can help this type of search.
+- **Keep `@Version` protection.** Phase 8 tests how overlapping updates behave.
+- **Save outbox rows with event changes in Phase 11** so messages such as `EventCreated` and `EventUpdated` are not lost between saving and sending.
+- **Limit requests to public list endpoints** so automated traffic cannot overwhelm them.
+- **Handle money and time consistently.** Store instants using `TIMESTAMPTZ` and display them in the appropriate time zone. A venue time of "19:00" needs the venue's zone to identify the instant.
+- **Record admin actions**, including who published or cancelled an event and when.
 
 ---
 

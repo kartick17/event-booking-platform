@@ -4,27 +4,44 @@
 **Needs:** Phase 2b finished (auth-service issuing tokens).
 **Pre-reading:** what a reverse proxy is.
 
-At the end of this doc, the client talks to **one port**, the JWT is checked once at the edge, every
-request carries a traceable id, and a spoofed identity header is impossible.
+By the end, clients use **one port**. The gateway checks JWTs, forwards requests, replaces client-supplied identity headers, and gives each request an id you can follow in the logs. Services must also be protected from direct outside access, as A4 explains.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+The gateway becomes the single address clients call. It checks the login token and sends each request to the right service. The services still do their own work, such as creating events or bookings.
+
+For example, the client sends a booking request to port 8080. The gateway checks the token, finds booking-service through Eureka, and forwards the request. The client does not need to know booking-service's address.
+
+Words used in this phase:
+
+- **Gateway / reverse proxy:** an application that receives requests and forwards them to other applications.
+- **Route:** a rule deciding where a request goes.
+- **Predicate:** a condition a request must match, such as its URL path.
+- **Header:** extra information sent with an HTTP request or response.
+- **Identity header:** a header saying which user the gateway verified.
+- **Reactive / event loop:** handling many connections with a small number of workers, without making those workers wait for slow work.
+- **CORS:** browser rules about calling a server at a different origin. An origin includes the protocol, host, and port.
+- **Correlation ID:** one label carried across services so you can find all logs for the same request.
+
+Start by understanding a route. Then follow one authenticated request through the gateway, including the headers it removes and adds.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Why a gateway at all
 
 Right now the client calls `localhost:8081`. Soon there will be `8082` and `8083`. Without a gateway:
 
-- **The client must know your topology.** Add a service, split one in two, change a port — every client
-  changes.
-- **Every service repeats the same work.** JWT verification, CORS, rate limiting, request logging, in
-  all three services, drifting apart over time.
-- **Every service must be reachable from the internet.** Three attack surfaces instead of one.
-- **CORS becomes three configurations.**
-- **No single place to trace a request.**
+- **Clients need every service address.** Changing a port or adding a service can require client changes.
+- **Services repeat common work**, such as checking tokens, setting browser access rules, and logging requests. Their settings can become different over time.
+- **Every public service needs its own protection.**
+- **Browser access rules need configuring in several places.**
+- **There is no shared place to start following a request.**
 
-A gateway is a **reverse proxy that understands your system**. One address for clients, one place for
-cross-cutting concerns, one door to defend.
+A gateway receives requests at one address and forwards them to the right service. It also provides one place for common checks, such as validating tokens. This type of forwarding application is called a **reverse proxy**.
 
 ```
               WITHOUT                              WITH
@@ -43,28 +60,22 @@ cross-cutting concerns, one door to defend.
 | Authentication (is this token valid?) | Fine-grained authorization ("is this *your* booking?") |
 | Coarse authorization (`/admin/**` needs ADMIN) | Database access |
 | CORS | Data transformation between services |
-| Rate limiting | Orchestrating multi-service workflows |
+| Rate limiting | Coordinating multi-service workflows |
 | Correlation IDs | Anything that blocks |
 
-**The rule:** if it needs to know your domain, it does not belong in the gateway. A gateway that grows
-business logic becomes a monolith that every team must change — the "god gateway" anti-pattern.
+**Keep business decisions in the services.** The gateway can check whether a token is valid, but booking-service decides whether a booking belongs to the current user. Putting all business rules in the gateway would make every service depend on changes to it.
 
 ### Gateway vs load balancer vs BFF
 
-- **Load balancer** (nginx, ALB): spreads traffic across identical instances. No idea what your
-  services are.
-- **API Gateway:** routes by path/host/header to *different* services, applies cross-cutting policy.
-- **BFF (Backend For Frontend):** one gateway per client type — a mobile BFF that merges three calls
-  into one small response, a web BFF that returns more. Useful at scale, unnecessary here.
+- **Load balancer** (nginx, ALB): chooses between running copies of the same application.
+- **API Gateway:** chooses between different services using the request path, host, or headers, and applies shared checks.
+- **BFF (Backend For Frontend):** a backend designed for one client type. A mobile app may need a smaller combined response than a web app. We do not need separate BFFs here.
 
 ## A2. Spring Cloud Gateway is reactive — this changes the rules
 
-Auth-service runs on **Tomcat with Spring MVC**: thread per request. 200 threads, 200 concurrent
-requests, each free to block on JDBC.
+Auth-service uses **Tomcat and Spring MVC**. A worker thread handles a request and can wait for the database. While it waits, that worker cannot handle another request.
 
-Spring Cloud Gateway runs on **Netty with WebFlux**: a handful of event-loop threads (typically one
-per CPU core) serve **thousands** of concurrent connections. A thread never waits — it registers a
-callback and moves to the next connection.
+The gateway uses **Netty and WebFlux**. A small set of event-loop threads handles many connections. When an operation needs time, the worker arranges to continue later and moves on to other connections. It must not sit waiting.
 
 **The consequence, and it is the one thing you must not forget:**
 
@@ -72,13 +83,10 @@ callback and moves to the next connection.
 > One blocked event-loop thread stalls every connection it was serving — not just yours.
 
 This is also why the gateway module must **not** include `spring-boot-starter-web`. Both starters on
-the classpath and Spring Boot picks Tomcat, silently disabling the gateway. The symptom — routes
+the classpath and Spring Boot picks Tomcat, without a clear error disabling the gateway. The symptom — routes
 return 404 with no error — wastes hours.
 
-**Node.js bridge:** the gateway works exactly like Node's event loop, and the same rule applies. A
-blocking call in a gateway filter is the same mistake as a synchronous `fs.readFileSync` in an Express
-handler under load. Auth-service is the model you *cannot* use in Node: one thread per request,
-blocking freely.
+**If you know Node.js:** the gateway follows a similar event-loop idea. A blocking operation in a gateway filter can delay many connections, just as a synchronous file read can delay other requests in Express. The Spring MVC services use a different model, where a worker may wait for one request.
 
 ## A3. How a route is defined
 
@@ -91,28 +99,23 @@ Every route is three things:
 Path=/api/v1/auth/**  StripPrefix, AddHeader   lb://auth-service
 ```
 
-**Predicates** — `Path`, `Method`, `Header`, `Query`, `Host`, `After`/`Before` (time based), `Weight`
-(for canary releases). They combine with AND.
+**Predicates are matching conditions.** Examples are `Path`, `Method`, `Header`, `Query`, and `Host`. `After`/`Before` match times; `Weight` splits traffic. Conditions on a route are combined with AND: they must all match.
 
 **Filters** — two directions:
 - **`pre`** filters run before forwarding: add headers, rewrite the path, check the token.
 - **`post`** filters run on the way back: add response headers, record metrics.
 
-**Route filters** apply to one route. **Global filters** apply to every route. Both run in an order you
-control — and with authentication involved, order is a security property, not a preference.
+**Route filters** run for one route. **Global filters** run for every route. Their order matters: for example, remove untrusted user headers before adding the verified user's headers.
 
-**`lb://auth-service`** — the `lb` scheme means "ask the registry for instances of `auth-service` and
-load-balance between them." Phase 1's Eureka client is what makes this work. Compare it to
-`http://localhost:8081`, which is exactly the hardcoding we set out to remove.
+**`lb://auth-service`** means: find running copies named `auth-service` using the saved Eureka list, then choose one. The address is no longer fixed to `http://localhost:8081`.
 
 ## A4. Edge authentication and the trust boundary
 
 Two models:
 
-**Verify in every service.** Each service holds the key and checks the token itself. Zero trust, more
-duplication, more places to leak the key.
+**Check the token in every service.** Each service validates the token itself. This repeats some work and requires distributing verification keys safely.
 
-**Verify at the edge.** The gateway checks the token once and forwards the identity as plain headers:
+**Check the token at the gateway.** The gateway verifies the token, then sends the verified user details to the service as headers:
 
 ```
 client ──[Authorization: Bearer eyJ...]──▶ gateway
@@ -133,32 +136,23 @@ If a client can reach a service **directly**, it can send whatever it likes:
 curl http://localhost:8082/api/v1/events -H "X-User-Roles: ROLE_ADMIN"
 ```
 
-and the service believes it. **Instant total compromise.**
+If the service accepts those headers from a direct caller, that caller can pretend to be another user or an admin.
 
 Two defences, and you need **both**:
 
-1. **The gateway must strip these headers from every incoming request** before setting its own. Never
-   trust a header a client could have sent. This is one line of config, and forgetting it is the whole
-   vulnerability.
-2. **Services must not be reachable from outside.** In production: a private network, security groups,
-   or a service mesh with mTLS. On your laptop they are exposed — which is fine for learning, as long
-   as you know it and can say so.
+1. **Remove client-supplied identity headers at the gateway.** Add new ones only after checking the token. Otherwise the client could choose its own user or role.
+2. **Block direct outside access to the services.** In production, use private networking or equivalent controls. A service mesh can also use mTLS, where services prove their identity to each other. Local direct access is convenient for learning, but it is not this production protection.
 
-**Interview answer:** "We authenticate at the edge and forward identity headers. That's only safe when
-the gateway strips client-supplied identity headers and the services are network-isolated. Without
-both, header spoofing is trivial. If services were internet-reachable I'd verify the JWT in each
-service too, using RS256 so only auth-service can mint tokens."
+> **How to explain it:** "The gateway checks the token and forwards user headers. This is safe only if it removes client-supplied copies and outside callers cannot reach services directly. If services were public, they would need to verify tokens themselves too. RS256 would let them verify without having the key that creates tokens."
 
 **Our choice:** verify at the gateway, strip aggressively, and note that services are exposed locally
 for convenience.
 
 ## A5. CORS in one pass
 
-**CORS (Cross-Origin Resource Sharing)** is a **browser** rule. A page on `localhost:3000` calling
-`localhost:8080` is a *different origin* (different port is enough), so the browser blocks the response
-unless the server opts in.
+**CORS (Cross-Origin Resource Sharing)** is enforced by browsers. A page at `localhost:3000` and an API at `localhost:8080` have different origins because their ports differ. The API must allow that origin before the browser lets the page read the response.
 
-For anything except a simple GET, the browser first sends a **preflight**:
+Some browser requests first send an **OPTIONS preflight**. This asks the server whether the intended method and headers are allowed:
 
 ```
 OPTIONS /api/v1/events
@@ -204,14 +198,9 @@ grep 7f3a91c2 *.log
 
 and you have the whole story in order.
 
-**MDC (Mapped Diagnostic Context)** is SLF4J's per-thread map of values that get added to every log
-line automatically. It is a `ThreadLocal`, so — exactly like `SecurityContextHolder` — **it must be
-cleared in a `finally` block**, or the next request on that pooled thread inherits the previous
-request's id. Debugging with wrong correlation ids is worse than having none.
+**MDC (Mapped Diagnostic Context)** stores values that the logger adds to each log line. In a normal servlet request, these values belong to the current thread. Clear them in a `finally` block: the thread will be reused, and the next request must not keep the previous request's id.
 
-This is a hand-rolled slice of what **distributed tracing** (Micrometer Tracing, OpenTelemetry, Jaeger)
-does properly, with spans and timings. Building it by hand first means the real thing will make sense
-later.
+This is a small introduction to **distributed tracing**: following one operation across several services. Tools such as Micrometer Tracing, OpenTelemetry, and Jaeger also record individual steps, called spans, and their timings.
 
 ---
 
@@ -265,7 +254,7 @@ Same parent block as the other modules (`relativePath` is `../../pom.xml`), then
 ```
 
 **Note what is missing: `spring-boot-starter-web`.** Concept A2 — adding it breaks the gateway
-silently. If routes ever return 404 for no reason, check this first.
+without a clear error. If routes ever return 404 for no reason, check this first.
 
 `data-redis-**reactive**`, not the blocking one, for the same reason. The rate limiter runs on the
 event loop.
@@ -378,10 +367,7 @@ jwt:
   issuer: auth-service
 ```
 
-**The same secret as auth-service.** That is HS256's cost, exactly as described in Phase 2b concept A2:
-the secret now lives in two places. Both read it from `JWT_SECRET`, so in a real deployment there is
-still one source — but two processes can now mint tokens, and that is the argument for RS256 the day
-you add a third verifier.
+**The gateway needs the same HS256 secret as auth-service.** Both read `JWT_SECRET`, but both processes can now create as well as verify signatures. RS256 can separate those abilities if more verifiers are added.
 
 **File:** `.../config/JwtProperties.java`
 
@@ -395,10 +381,7 @@ public record JwtProperties(String secret, String issuer) {
 }
 ```
 
-**Yes, this is nearly identical to auth-service's version, and we are copying it on purpose.** Roadmap
-§5.2: a shared module would couple the gateway's deployment to auth-service's. Also note the shapes
-already differ — the gateway never issues tokens, so it needs no TTLs. Duplication that diverges is
-duplication that was correct.
+**Copy this small class into the gateway.** A shared module would make services depend on the same code release. The gateway version is already different: it only verifies tokens, so it does not need token-lifetime settings.
 
 ## Step 5 — Token verification at the edge
 
@@ -439,9 +422,7 @@ public class JwtValidator {
 }
 ```
 
-Pure CPU work — no I/O, nothing to block on. **This is why edge authentication is cheap:** verifying a
-signature takes microseconds and needs no database, no cache, no call to auth-service. That property is
-the entire argument for stateless tokens.
+Token signature verification uses local calculations. It does not need a database lookup or a request to auth-service. That helps the gateway check requests without waiting for another service.
 
 ## Step 6 — Which paths are public
 
@@ -495,14 +476,9 @@ public final class PublicEndpoints {
 **`OPTIONS` is always public** — concept A5. Preflight requests carry no `Authorization` header. Miss
 this and every browser call fails while curl works fine.
 
-**Public paths are an allow-list, not a deny-list.** "Everything is protected unless listed" fails
-safe: forget to list a new endpoint and it is *locked*, which is a bug you notice immediately. A
-deny-list fails open — forget one and it is *exposed*, which nobody notices until it is too late.
+**List public paths; protect everything else.** If you forget to add a new public endpoint, it remains protected and the error is easy to notice. Listing only protected paths risks leaving a forgotten endpoint public.
 
-**Method-specific rules.** Anyone may browse events (`GET`); only an authenticated admin may create
-one. `/api/v1/events/*` matches one segment, so `/api/v1/events/42` is public but
-`/api/v1/events/42/attendees` is not. `AntPathMatcher` gives `*` = one segment, `**` = any depth. That
-distinction is a security boundary — read your patterns carefully.
+**Check the HTTP method as well as the path.** Public event browsing uses `GET`; creating an event needs an admin. `/api/v1/events/*` matches one path segment, such as `/api/v1/events/42`, but not `/api/v1/events/42/attendees`. With `AntPathMatcher`, `*` matches one segment and `**` can match several.
 
 **Note that `/api/v1/auth/logout` is deliberately absent**, so it requires a valid token. It is listed
 here for you to notice: every path in or out of this file is a decision.
@@ -553,9 +529,7 @@ public class AuthenticationGatewayFilter implements GlobalFilter, Ordered {
 }
 ```
 
-`GlobalFilter` = applies to every route. `Ordered` with `-100` puts it early — **before** the routing
-filter (order `10000`) that actually forwards the request. Authentication must happen before
-forwarding, obviously; less obviously, order is the *only* thing enforcing that.
+`GlobalFilter` runs for every route. `Ordered` with `-100` runs this filter before the routing filter at `10000`. This makes authentication happen before the request is forwarded.
 
 **Now the filter body.** Add:
 
@@ -604,23 +578,16 @@ forwarding, obviously; less obviously, order is the *only* thing enforcing that.
 
 **The most important seven lines are the first ones.**
 
-Stripping `X-User-Id` and `X-User-Roles` from the incoming request happens **before anything else**,
-including the public-path check. Concept A4: a client can send any header it likes. If we only *added*
-our own without removing theirs, a request arriving with `X-User-Roles: ROLE_ADMIN` would reach the
-service with two values for that header — and how a downstream framework picks between them is not
-something you want your security to depend on.
+**Remove `X-User-Id` and `X-User-Roles` before any other identity decision, including the public-path check.** If you only add a new header, a client-supplied value may remain alongside it. Do not let the receiving service choose between a fake role and a verified role.
 
 **Strip first, then set. Every time. No exceptions.** You will drill this in a minute.
 
 The rest:
 
-- **`request.mutate()`** — the reactive request is immutable, so you build a modified copy and swap it
-  into the exchange. `exchange.mutate().request(...)` is the swap.
-- **`"ACCESS"` type check** — Phase 2b, step 3. A refresh token must not open protected endpoints.
-- **Roles as a comma-joined string** — headers are strings. Downstream services split on `,`. Simple
-  and debuggable; the alternative (a JSON header) is harder to read in a proxy log for no gain.
-- **`catch (JwtException)` → 401**, never 500. An invalid token is a client problem, and the status
-  code says so.
+- **`request.mutate()`** creates a changed copy of the reactive request because the original cannot be edited directly. `exchange.mutate().request(...)` installs that copy.
+- **Check the `"ACCESS"` type** so refresh tokens are not accepted for ordinary protected endpoints.
+- **Join roles with commas** because headers carry strings. The receiving service splits on `,`.
+- **Return 401 for `JwtException`.** A rejected token is a login problem, not an internal 500 error.
 
 **Add the two helpers:**
 
@@ -711,10 +678,8 @@ public class CorrelationIdFilter implements GlobalFilter, Ordered {
 **Order `-200`: before authentication.** Deliberate — a *rejected* request still needs an id, or your
 401s are the ones you cannot trace, and those are exactly the ones users complain about.
 
-**Reusing an incoming id** rather than always generating one is what makes tracing work across
-systems. If a mobile app or an upstream gateway already started a trace, we join it instead of breaking
-the chain. (In production you would validate its format so a client cannot inject `\n` into your log
-lines — a real log-injection vector.)
+**Reuse an existing correlation id when joining a request from another system.** This keeps its earlier logs connected to ours. In production, validate the id format so a caller cannot insert line breaks such as `
+` into logs.
 
 **Echoing it in the response header** means a user can copy the id from their browser's network tab
 into a support ticket, and you can find their exact request.
@@ -854,17 +819,10 @@ Copy this filter and this pattern into every service you build from here on.
 
 **Each setting, and the reason:**
 
-- **`allowedOrigins` is an explicit list**, not `"*"`. Concept A5: `*` with `allowCredentials: true` is
-  rejected outright by browsers. Beyond that, a wildcard lets any site on the internet call your API
-  from a logged-in user's browser.
-- **`exposedHeaders: X-Correlation-Id`** — by default JavaScript can only read a handful of response
-  headers. Without this line, `response.headers.get('X-Correlation-Id')` returns `null` and your
-  frontend cannot show the id in an error message.
-- **`maxAge: 3600`** — the browser caches the preflight for an hour instead of sending `OPTIONS` before
-  every call. A real, free latency win.
-- **`allowCredentials: true`** — needed only if the browser sends cookies. With a bearer token in a
-  header it is not strictly required; keep it if you might move the refresh token into an httpOnly
-  cookie later.
+- **List `allowedOrigins`** rather than using `"*"`. Browsers reject a wildcard origin with `allowCredentials: true`. List only the browser applications that should read these responses.
+- **`exposedHeaders: X-Correlation-Id`** lets browser JavaScript read that response header. Otherwise `response.headers.get('X-Correlation-Id')` may return `null`.
+- **`maxAge: 3600`** lets the browser reuse the preflight permission for an hour, reducing repeated `OPTIONS` requests.
+- **`allowCredentials: true`** allows browser credentials such as cookies. A bearer token explicitly added in a header does not itself require this option; a later refresh-cookie design may.
 
 **Configure CORS in exactly one place.** Gateway *and* service both adding headers produces duplicates,
 and the browser rejects a doubled `Access-Control-Allow-Origin`.
@@ -1152,22 +1110,17 @@ two processes, one story. Multiply that by five services and you understand why 
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Run several gateway instances** behind a real load balancer. The gateway is stateless, so this is
-  easy — and it is also why the rate limiter must live in Redis.
-- **TLS terminates at the edge.** Bearer tokens on plain HTTP are readable by anyone on the path.
-- **Timeouts on every route** (`spring.cloud.gateway.httpclient.connect-timeout` /
-  `response-timeout`). No timeout means a slow service can hold gateway connections indefinitely.
-- **Do not log the `Authorization` header.** Access logs are copied, shipped and indexed.
-- **Request size limits** to blunt trivial denial-of-service.
-- **Network isolation** for services, as drilled above. This is the load-bearing assumption of edge
-  auth.
-- **Move to RS256 + JWKS** when more than one component verifies tokens, so only auth-service can mint.
-- **Real tracing** (Micrometer Tracing + OpenTelemetry) rather than hand-rolled ids, once you want
-  timings and spans as well as correlation.
-- **Health-based routing:** set `eureka.client.healthcheck.enabled=true` in the services so an instance
-  with a dead database reports `DOWN` and stops receiving traffic.
+- **Run multiple gateway instances behind a load balancer** if one process is not enough. Use shared Redis rate-limit data so each instance follows the same limits.
+- **Use TLS/HTTPS at the public entry point.** Plain HTTP exposes bearer tokens to someone on the network path.
+- **Set route timeouts** using `spring.cloud.gateway.httpclient.connect-timeout` and `response-timeout`, so slow calls do not wait forever.
+- **Never log the `Authorization` header.** Log copies can otherwise expose working tokens.
+- **Limit request sizes** so oversized requests cannot consume unlimited resources.
+- **Prevent direct outside access to services.** Header-based identity depends on this protection.
+- **Consider RS256 and JWKS** when several components verify tokens, keeping the signing key only in auth-service.
+- **Add tracing tools** such as Micrometer Tracing and OpenTelemetry when you need timings for individual steps as well as request ids.
+- **Report dependency health** with `eureka.client.healthcheck.enabled=true`, so Eureka learns when a service cannot use its database.
 
 ---
 

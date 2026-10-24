@@ -9,11 +9,33 @@ you can explain every step out loud.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+Phase 2a checked the password. This phase gives the user a token after login, so they do not send the password on every request. It also adds roles, token renewal, and logout.
+
+Think of an access token as a short-lived pass. The application checks the pass on each visit. A refresh token lets the user get a new pass without logging in again. A stolen pass may still work until its expiry time, so keeping that time short matters.
+
+Words used in this phase:
+
+- **JWT:** a token containing readable data and a signature that helps detect changes.
+- **Claim:** one piece of data in a token, such as the user's email or expiry time.
+- **Signature:** a value calculated with a key to check who issued the token and whether it changed.
+- **Access token:** the short-lived token sent to protected endpoints.
+- **Refresh token:** the longer-lived token exchanged for a new access token.
+- **Rotation:** replacing a refresh token with a new one each time it is used.
+- **Revocation:** making a saved token unusable.
+- **RBAC:** Role-Based Access Control; roles such as USER and ADMIN decide permissions.
+- **Stateless check:** verifying an access token without looking up a saved login session.
+
+Start with the two-token flow in A3. Then follow login, one protected request, refresh, and logout as four separate actions.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. What a JWT actually is
 
-**JWT = JSON Web Token.** Three Base64url-encoded parts joined by dots:
+**JWT = JSON Web Token.** In the signed format used here, it has three parts separated by dots. Base64url converts the data into text suitable for a token; it does not hide the data:
 
 ```
 eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiJrYXJ0aWNrQHgu... . 4pB7XlKQ9m2f...
@@ -41,8 +63,7 @@ eyJhbGciOiJIUzI1NiJ9 . eyJzdWIiOiJrYXJ0aWNrQHgu... . 4pB7XlKQ9m2f...
 
 ### The single most important fact
 
-**Base64 is encoding, not encryption.** Anyone holding the token can read the payload. jwt.io does it
-in your browser with no key.
+**Encoding does not hide data.** Anyone with the token can read its payload without knowing the signing key. For example, jwt.io can show the fields in your browser.
 
 So:
 - **Never put secrets in a JWT.** No passwords, no card numbers, no personal data you would not print
@@ -51,9 +72,7 @@ So:
   byte of the payload and the signature no longer matches, because they cannot recompute it without
   the secret key. Verification fails and the token is rejected.
 
-> **Interview definition:** "A JWT is a signed, not encrypted, JSON document. The signature proves it
-> was issued by us and has not been modified — it does not hide anything. Anyone can read the payload;
-> nobody can change it without the key."
+> **How to explain it:** "Our JWT contains readable JSON and a signature. The signature lets us check the issuer and detect changes. It does not keep the contents secret."
 
 ### Registered claims worth knowing
 
@@ -61,7 +80,7 @@ So:
 |---|---|---|
 | `sub` | subject — who the token is about | yes, the email |
 | `iat` | issued at | yes |
-| `exp` | expires at | yes, non-negotiable |
+| `exp` | expires at | yes, required |
 | `jti` | JWT id, unique per token | yes, needed for revocation |
 | `iss` | issuer | yes, `auth-service` |
 | `aud` | audience — who it is for | later, if services need different tokens |
@@ -75,13 +94,9 @@ All times are **seconds since epoch, UTC**. Never local time.
 
 **RS256 (RSA)** — a **key pair**: the private key signs, the public key verifies.
 
-Why this matters here: in our system, the **gateway** verifies tokens, and later each **service** may
-verify them too. With HS256 every one of those needs the shared secret — and a secret that four
-services hold is a secret that can leak from four places. Worse, any of them could *mint* tokens,
-because signing and verifying use the same key.
+The gateway checks tokens, and other services may later check them too. With HS256, every verifier needs the same secret key. Anyone holding that key can also create tokens, so each extra copy of the key adds another place it could be stolen.
 
-With RS256, only auth-service holds the private key. Everyone else gets the public key, which can be
-published openly. A leaked public key allows verification, never forgery.
+With RS256, auth-service keeps the private key used to create signatures. Other services get only the public key used to check signatures. Knowing the public key does not allow them to create valid tokens.
 
 | | HS256 | RS256 |
 |---|---|---|
@@ -91,18 +106,13 @@ published openly. A leaked public key allows verification, never forgery.
 | Speed | faster | slower to sign |
 | Right for | single service, or one trusted verifier | multiple services, third parties |
 
-**Our choice: HS256, with the gateway as the only verifier.** Reasons: it keeps the moving parts down
-while you learn, and our design has services trust the gateway's `X-User-Id` header rather than
-re-verifying (Phase 3 explains why that is safe *only* when services are unreachable from outside).
+**We use HS256 to keep this learning project simpler.** The gateway checks the token, and the other services trust its `X-User-Id` header. Phase 3 explains the condition: outside callers must not be able to reach those services directly.
 
-**Be honest about it in an interview:** "We used HS256 with a single verification point at the gateway.
-For a larger estate I'd move to RS256 with a JWKS endpoint, so services fetch the public key and no
-service but the issuer can mint tokens." That answer shows you know the trade, not just the code.
+> **How to explain the choice:** "We use HS256 and check tokens at the gateway. If several services needed to verify tokens, I would consider RS256. Auth-service would keep the private key, and a JWKS endpoint would publish the public verification keys."
 
 ## A3. Why two tokens
 
-A single long-lived token is a bad deal either way: short expiry means users log in constantly, long
-expiry means a stolen token is usable for weeks.
+One token lifetime creates a difficult choice. A short lifetime makes users log in often. A long lifetime gives someone more time to use a stolen token. Access and refresh tokens help balance these needs.
 
 Two tokens split the problem:
 
@@ -112,7 +122,7 @@ Two tokens split the problem:
 | Sent | on every request | only to `/auth/refresh` |
 | Stored server-side | **no** | **yes**, in a table |
 | Can be revoked | not really | yes, delete the row |
-| Contains | sub, roles, exp | a random opaque id (or a minimal JWT) |
+| Contains | sub, roles, exp | a random random and without readable data id (or a minimal JWT) |
 
 The flow:
 
@@ -127,18 +137,13 @@ login ──▶ access(15m) + refresh(7d)
                  → new access token (+ a new refresh token: rotation)
 ```
 
-**Why this is a genuine security win:** the access token travels on every request — more chances to
-leak through logs, proxies, browser extensions — but it is worthless 15 minutes later. The refresh
-token is long-lived but travels rarely, and because we store it, we can delete it. That is how you get
-logout in a "stateless" system.
+The access token is sent often, but it expires after 15 minutes. The refresh token is used less often and is recorded in our database, so we can revoke it. This stops new access tokens from being issued after logout, while existing access tokens can still work until they expire.
 
 ## A4. The revocation problem
 
-**Stateless means the server holds nothing.** So how do you log someone out, or block a stolen token,
-before it expires?
+**A stateless access-token check does not look up a saved session.** How can the server reject a stolen token before its expiry if it does not check any saved revocation information?
 
-Honest answer: **you cannot delete a JWT.** It is a signed piece of paper already in the wild. You can
-only limit the damage. The options:
+The server cannot remove a token from someone else's device. It can only stop accepting it. A fully stateless check will still accept it until expiry, so these are the options:
 
 | Approach | How | Cost |
 |---|---|---|
@@ -147,12 +152,9 @@ only limit the damage. The options:
 | Blacklist by `jti` | store revoked ids in Redis until `exp` | a Redis lookup per request — you just gave up statelessness |
 | Token version | a counter on the user; tokens carry it; bump it to kill all tokens | a user lookup per request |
 
-**Our choice: short expiry + a refresh token table.** Logout deletes the refresh row, so no new access
-tokens can be minted; the current access token stays valid for at most 15 minutes.
+**We choose short expiry and a refresh-token table.** Logout makes the stored refresh token unusable, stopping further access tokens from being issued through it. An access token already issued may still work for up to 15 minutes.
 
-**Say this out loud once so it sticks:** logout in a stateless system is *best effort*. If you truly
-need instant revocation, you need per-request server state, and then you are not stateless any more.
-That is the trade, and pretending otherwise is how people build systems they cannot explain.
+**Remember:** logout stops refreshes, but does not immediately cancel an access token that has already been issued. Immediate rejection needs an extra server-side check on requests. That is an extra cost of making logout immediate.
 
 ### Refresh token rotation and reuse detection
 
@@ -165,10 +167,7 @@ attacker refreshes → gets token B, our row now holds B
 victim refreshes with the old token A → A is not valid any more
 ```
 
-That failure is a **signal**. A valid-looking but already-used refresh token means one of two people
-holds a copy. The correct response is not just to reject it — it is to **delete every refresh token
-for that user**, forcing a fresh login and killing the attacker's session too. This is *reuse
-detection*, and it is what turns rotation from bookkeeping into an actual defence.
+If a refresh token that was already replaced is used again, someone may have copied it. We cannot tell which holder is legitimate. **Revoke all refresh tokens for that user** so both must log in again. This is called **reuse detection**.
 
 ## A5. Where the filter sits
 
@@ -196,7 +195,7 @@ DispatcherServlet → controller
    public, fine; if not, 401. Throwing inside the filter bypasses your `@RestControllerAdvice`
    entirely — the request never reaches `DispatcherServlet` — and you get an ugly default error page.
 2. **Never `return` without calling `chain.doFilter(...)`** unless you deliberately want to end the
-   request there. Forgetting it makes the request vanish silently with an empty 200.
+   request there. Forgetting it makes the request vanish without a clear error with an empty 200.
 
 ---
 
@@ -226,9 +225,7 @@ DispatcherServlet → controller
         </dependency>
 ```
 
-Three artifacts, on purpose: you compile against `jjwt-api` only, and the implementation is swapped in
-at runtime. Your code cannot accidentally depend on internals. Same reason the Postgres driver was
-`runtime` scope in Phase 2a.
+There are three JJWT dependencies. Your code uses `jjwt-api` when it compiles; the other libraries provide the implementation when it runs. This keeps your code from depending on internal library classes. Phase 2a used the same idea with the Postgres driver's `runtime` scope.
 
 Explicit `<version>` here because JJWT is not in the Spring Boot BOM — Spring does not manage it, so
 you must. **Better practice:** move the version to a `<jjwt.version>` property in the root POM, so all
@@ -250,10 +247,7 @@ jwt:
 fallback exists so a fresh clone runs; the environment variable is what you set in any real
 environment.
 
-**Say the rule plainly: a signing key committed to Git is a breach.** Anyone with repo access — now or
-in five years, including anyone who forks it — can mint admin tokens. Our default is deliberately a
-throwaway dev value. Real secrets live in environment variables, and in production in a secret manager
-(Vault, AWS Secrets Manager, Kubernetes Secrets).
+**Never commit a real signing key to Git.** Anyone who gets that key can create tokens, including admin tokens. The default here is only for local learning. Set a real key through the environment or a secret manager in a real environment.
 
 `PT15M` and `P7D` are **ISO-8601 durations**. Spring converts them straight to `java.time.Duration`.
 `PT15M` = 15 minutes, `P7D` = 7 days. Much harder to misread than `900000`.
@@ -328,8 +322,7 @@ public class JwtService {
 }
 ```
 
-The key is built **once in the constructor**, not on every call. Key derivation is not free and this
-method runs on every single request that carries a token.
+The constructor builds the key once. We reuse it because token verification runs on every request that carries a token; rebuilding the key each time would repeat unnecessary work.
 
 `Keys.hmacShaKeyFor` **throws if the secret is shorter than 256 bits (32 bytes)** for HS256. That is
 the library refusing to let you weaken your own security — a short key makes brute-forcing the
@@ -360,19 +353,13 @@ openssl rand -base64 48
 
 **Each claim, and why it is there:**
 
-- `.id(...)` → `jti`. A unique id per token. You need it the day you add a revocation list, and you
-  cannot add it retroactively to tokens already issued.
-- `.subject(email)` → `sub`. Who this is. The filter reads it back to build the `Authentication`.
-- `.issuer(...)` → `iss`. Lets a verifier reject tokens minted by some other system that happens to
-  share an algorithm.
-- `.expiration(...)` → `exp`. **The single most important claim.** A token without `exp` is a password
-  that never changes.
-- `"roles"` — a **custom** claim. This is what makes the token self-contained: the gateway can decide
-  `hasRole('ADMIN')` without one call to auth-service. That is the whole point of stateless auth.
-- `"type": "ACCESS"` — so an access token can never be replayed at the refresh endpoint, or the other
-  way round. Without it, a stolen 15-minute access token could be used to mint fresh tokens forever.
-  Small claim, real attack closed.
-- `.compact()` builds and signs, returning the final string.
+- `.id(...)` sets `jti`, a unique token id. It can identify a token in a later revocation list. Tokens already issued cannot have this field added afterwards.
+- `.subject(email)` sets `sub`, the user the token describes. The filter uses it when creating `Authentication`.
+- `.issuer(...)` sets `iss`, the system that created the token. A verifier can reject a different issuer.
+- `.expiration(...)` sets `exp`, the time after which the token must be rejected. Always give access tokens an expiry.
+- `"roles"` is our own claim holding permissions. The gateway can check `hasRole('ADMIN')` without asking auth-service on every request.
+- `"type": "ACCESS"` identifies the token's purpose. Check the purpose at the receiving endpoint so an access token cannot be exchanged as a refresh token.
+- `.compact()` builds and signs the final token string.
 
 **Note what is *not* in there:** no name, no phone number, no anything private. Concept A1 — the
 payload is readable by anyone holding the token.
@@ -396,7 +383,7 @@ Add to `JwtService`:
 **What this one call actually checks:**
 
 1. The token has three parts and decodes.
-2. **The signature matches** — recomputed with our key. This is where a tampered payload dies.
+2. **The signature matches** — recomputed with our key. This is where a changed without permission payload dies.
 3. `exp` is in the future.
 4. `nbf`, if present, is in the past.
 5. `iss` equals ours (because we asked with `requireIssuer`).
@@ -404,14 +391,9 @@ Add to `JwtService`:
 Anything wrong throws a subclass of `JwtException`: `ExpiredJwtException`, `SignatureException`,
 `MalformedJwtException`.
 
-`clockSkewSeconds(60)` matters more than it looks. Servers' clocks drift. Without tolerance, a token
-issued by a machine 2 seconds ahead is "not valid yet" on another machine, and you get random,
-unreproducible auth failures. 60 seconds is the usual allowance.
+`clockSkewSeconds(60)` allows a small difference between server clocks. Without this tolerance, a token created on a clock that is slightly ahead might appear not to be valid yet on another server. This example allows 60 seconds.
 
-Note `parseSignedClaims`, not `parseClaimsJwt`. The "signed" variant refuses unsigned tokens. This
-closes the classic **`alg: none` attack**: an attacker rewrites the header to say "no algorithm",
-strips the signature, and a naive parser accepts it. Old JWT libraries fell for this; modern ones must
-be asked for the signed variant.
+Use `parseSignedClaims`, not `parseClaimsJwt`. We require a signed token. Some attacks change the token header to `alg: none` and remove the signature; requiring signed claims prevents an unsigned token from being accepted this way.
 
 **Now the small readers.** Add:
 
@@ -431,13 +413,13 @@ be asked for the signed variant.
 
 The unchecked cast is unavoidable: JSON arrays deserialise to `List<Object>`, and generics are erased
 at runtime so nothing can verify the element type. The `instanceof` pattern plus `String::valueOf`
-keeps a malformed token from becoming a `ClassCastException` deep in the filter.
+keeps a incorrectly formatted token from becoming a `ClassCastException` deep in the filter.
 
 ## Step 5 — The refresh token table
 
 **File:** `.../resources/db/migration/V2__create_refresh_tokens_table.sql`
 
-**V2, not an edit to V1.** Concept A5 in Phase 2a — applied migrations are immutable.
+**V2, not an edit to V1.** Concept A5 in Phase 2a — applied migrations are fixed after creation.
 
 ```sql
 CREATE TABLE refresh_tokens (
@@ -456,14 +438,10 @@ CREATE INDEX idx_refresh_tokens_expires_at ON refresh_tokens (expires_at);
 
 **The design decisions:**
 
-- `UNIQUE (token)` — also gives you the index that every lookup uses. Every refresh request is
-  `WHERE token = ?`; without an index that is a full table scan on a table that grows forever.
-- `idx_..._user_id` — for "revoke everything for this user" on logout and on reuse detection.
-- `idx_..._expires_at` — for the cleanup job that deletes expired rows. Without it, that job gets
-  slower every day until it becomes an incident.
-- `revoked BOOLEAN` rather than deleting the row: for a while you can still tell the difference between
-  "never existed" (someone is guessing) and "used and rotated" (possible theft). That distinction is
-  what makes reuse detection possible.
+- `UNIQUE (token)` prevents duplicate token values and gives token lookups an index. Without an index, a lookup using `WHERE token = ?` may scan the table.
+- `idx_..._user_id` helps revoke every refresh token for a user, such as after detecting reuse.
+- `idx_..._expires_at` helps the cleanup job find expired rows without scanning everything.
+- `revoked BOOLEAN` keeps the record after revocation. That lets the server distinguish an unknown token from a token already used and replaced, which is needed for reuse detection.
 
 **This table is the price of being able to log out.** Worth naming plainly: the "stateless" system has
 exactly one piece of state, and this is it.
@@ -522,11 +500,7 @@ public class RefreshToken {
 
 (Add getters for `token`, `userId`, `expiresAt`, `revoked`.)
 
-`Long userId` instead of `@ManyToOne User user`. **This is a deliberate modelling choice, not
-laziness.** A `@ManyToOne` drags a whole `User` object into every refresh operation and invites lazy
-loading problems. Refresh only ever needs the id. Storing the id keeps the two aggregates separate —
-which is exactly the discipline you need later when `booking` references an `event` that lives in
-another service and cannot be a foreign key at all. Practising it here makes Phase 6 feel natural.
+We store `Long userId` rather than `@ManyToOne User user` because refreshing a token only needs the user id. Loading a whole user object adds extra work and can trigger unexpected database reads. This also prepares you for Phase 6, where a booking refers to an event in another service by id.
 
 `isUsable()` on the entity, not in the service: the rule "usable means not revoked and not expired"
 belongs to the thing it describes. Every caller gets it right for free.
@@ -559,10 +533,7 @@ expecting a result set. Forget it and you get a confusing "Not supported for DML
 Why a bulk `update` rather than loading the rows and calling `revoke()` on each: one SQL statement
 instead of N+1. A user with 40 devices would otherwise mean 41 queries.
 
-**The catch, and it is a real one:** a `@Modifying` query goes **straight to the database and bypasses
-the persistence context**. Entities already loaded in this transaction keep their stale `revoked`
-value. Add `@Modifying(clearAutomatically = true)` if you read those entities again in the same
-transaction. This is a classic production bug.
+**Watch out:** a `@Modifying` query changes the database directly. Java entities already loaded in the same transaction may still show the old `revoked` value. If the code reads them again, use `@Modifying(clearAutomatically = true)` so Hibernate does not reuse those old values.
 
 ## Step 7 — Issuing tokens on login
 
@@ -626,19 +597,11 @@ smoother UX.
 
 **Two things to notice:**
 
-The authorities come from the **`Authentication` object**, not from a second database read. The
-`DaoAuthenticationProvider` already loaded them through your `UserDetailsService` during
-`authenticate()`. Reading them again would be a wasted query — and, worse, a chance for the two values
-to disagree.
+Use the authorities already in the **`Authentication` object**. `DaoAuthenticationProvider` loaded them through `UserDetailsService` during `authenticate()`. Reading them again would repeat a query and could give a different answer if roles changed between reads.
 
-**The refresh token is a random UUID, not a JWT.** That is deliberate. A refresh token is only ever
-checked against our database, so it needs no self-contained claims. An opaque random string leaks
-nothing if it appears in a log, and it cannot be inspected by whoever holds it.
+**The refresh token is a random UUID, not a JWT.** We check it against a database record, so it does not need to contain user details. The string has no readable claims. It is still a secret credential: whoever holds a usable one can try to refresh.
 
-**Production note:** we store the refresh token in plain text. A leaked database dump therefore hands
-over live sessions. The production move is to store a **SHA-256 hash** of it and look up by hash —
-same idea as passwords, and cheap to do since these are already random, so no BCrypt is needed. Left
-plain here so you can `SELECT` it and see what is happening; flagged so you know it is a real gap.
+**For a real system, store a hash of the refresh token.** This example stores plain text so you can inspect it with `SELECT`. That means a stolen database copy exposes usable refresh tokens. A SHA-256 hash is appropriate for these already-random tokens: hash the presented token and look up that hash. Passwords still need a slow password hash such as BCrypt.
 
 ## Step 8 — Refresh with rotation
 
@@ -675,20 +638,11 @@ Add to `AuthService`:
 `stored.revoke()` before issuing the new one — that is **rotation**. The old token dies the moment it
 is used.
 
-`revokeAllForUser(...)` when an unusable token is presented — that is **reuse detection** (concept
-A4). Someone presented a token we issued but already retired. Either an attacker has a copy, or the
-legitimate user does. We cannot tell which, so we kill every session for that user. Both parties must
-log in again; only one of them can.
+Calling `revokeAllForUser(...)` for an unusable stored token is the reuse check from A4. It may mean someone copied an old token. We revoke the user's refresh tokens because we cannot safely decide which holder to trust.
 
-**Roles are read fresh from the database here**, not copied from the old token. This is how a
-permission change takes effect: promote a user to ADMIN and their *next* refresh — at most 15 minutes
-away — carries the new role. Copying old claims forward would mean a demoted admin keeps admin rights
-for a week.
+**Read roles from the database during refresh.** A new access token should contain current permissions, not copy old roles from an expired token. Otherwise a removed admin role could remain in newly issued tokens.
 
-`stored.revoke()` needs no explicit `save()`. Inside `@Transactional`, `stored` is a **managed**
-entity; Hibernate's dirty checking compares it against its loaded snapshot at flush time and issues
-the `UPDATE` itself. Calling `save()` would work but is redundant — and understanding *why* it is
-redundant is the difference between using JPA and guessing at it.
+You do not need to call `save()` after `stored.revoke()`. Inside `@Transactional`, Hibernate tracks changes to this loaded entity and writes them to the database when it flushes. This automatic tracking is called **dirty checking**.
 
 **Add the exception** in `.../exception/InvalidTokenException.java`:
 
@@ -731,13 +685,9 @@ Add to `AuthService`:
     }
 ```
 
-**`ifPresent` — no exception on an unknown token.** Logout must be **idempotent**: calling it twice, or
-with rubbish, succeeds quietly. A logout endpoint that errors is a logout endpoint that leaves users
-stuck in a broken state, and it also tells an attacker which tokens exist.
+**`ifPresent` lets logout succeed even if the token is unknown.** Repeating logout should leave the user logged out rather than produce an error. This is **idempotency**: repeating an action has the same final effect. It also avoids revealing which tokens exist.
 
-**Say the honest thing again:** this revokes the *refresh* token. The user's current access token keeps
-working until it expires — up to 15 minutes. Concept A4. If a product genuinely cannot accept that
-window, it needs a `jti` blacklist in Redis checked on every request, and it is no longer stateless.
+**Logout revokes the refresh token.** The current access token can keep working for up to 15 minutes. Rejecting it sooner would need a saved list of revoked `jti` values, checked on every request, so access-token verification would no longer be fully stateless.
 
 ## Step 10 — The JWT filter
 
@@ -830,10 +780,7 @@ dispatches. Twice would mean parsing and verifying the token twice per request.
 **`getAuthentication() == null` check** — do not overwrite an identity that an earlier filter already
 established. Without it, filter ordering bugs become silent identity bugs.
 
-**`catch (JwtException)` then `chain.doFilter(...)` anyway** — concept A5. A bad token is not an error
-here; it simply means *nobody is authenticated*. `AuthorizationFilter` further down decides whether
-this endpoint tolerates that. Throwing here would skip `DispatcherServlet` and your
-`@RestControllerAdvice` with it.
+**Catch `JwtException` and continue with `chain.doFilter(...)`.** A bad token leaves no verified user in the context. Later security checks decide whether the endpoint allows an anonymous request. Throwing here does not go through the controller's `@RestControllerAdvice`.
 
 **`SecurityContextHolder.clearContext()` in the catch** — belt and braces. Never leave a half-built
 context behind.
@@ -841,14 +788,10 @@ context behind.
 **`credentials = null`** in the token constructor — the raw credential is not kept in memory after use.
 Same reasoning as `DaoAuthenticationProvider` wiping it.
 
-**The three-argument constructor is what marks the token authenticated.** `new
-UsernamePasswordAuthenticationToken(principal, credentials)` — two arguments — creates an
-*unauthenticated* token. The three-argument version, with authorities, sets `authenticated = true`.
-Getting this wrong gives you a populated context that still fails authorization, and the cause is not
-obvious from the error.
+**The three-argument constructor marks the token as authenticated.** The two-argument `UsernamePasswordAuthenticationToken(principal, credentials)` represents details that still need checking. The three-argument form includes authorities and sets `authenticated = true`. Using the wrong form leaves the user unverified.
 
 **`chain.doFilter(...)` outside every branch** — the request always continues. Forgetting this returns
-an empty 200 and no log line, which is a genuinely horrible bug to chase.
+an empty 200 and no log line, which is a really horrible bug to chase.
 
 **`log.debug`, not `log.warn`** — invalid tokens are routine (expired ones happen constantly). At warn
 level this line would flood your logs. And note that **the token itself is never logged.** A token in a
@@ -869,12 +812,7 @@ Take `JwtAuthenticationFilter` in the constructor, then add to the chain:
 and every protected endpoint returns 401 forever, because authorization is decided before anyone is
 authenticated.
 
-Note the filter is a `@Component` **and** added explicitly here. That has one side effect worth
-knowing: Spring Boot also registers any `Filter` bean with the servlet container automatically, so it
-would run twice — once in the container chain, once in the security chain. `OncePerRequestFilter`
-saves you from the visible symptoms, but the clean fix is a `FilterRegistrationBean` with
-`setEnabled(false)`, or dropping `@Component` and constructing it here. Worth knowing because the
-symptom (a filter running outside the security chain) is confusing.
+**Avoid registering this filter twice.** A `@Component` filter can be registered automatically by the web server and also added to Spring Security here. `OncePerRequestFilter` limits repeated execution, but a cleaner setup disables the server registration with `FilterRegistrationBean` and `setEnabled(false)`, or creates the filter here without `@Component`.
 
 ## Step 12 — Proper 401 and 403 bodies
 
@@ -937,9 +875,7 @@ public class SecurityExceptionHandlers {
 These exist as separate hooks precisely because the two cases are different, and Spring will not let
 you conflate them.
 
-`ObjectMapper` is injected rather than created: Spring Boot's instance carries your date format,
-naming strategy and modules. A `new ObjectMapper()` here would serialise `Instant` differently from
-every other endpoint — a small inconsistency that is annoying to track down.
+Inject Spring Boot's `ObjectMapper` so it uses the same date formatting, naming rules, and JSON modules as other endpoints. Creating `new ObjectMapper()` could format an `Instant` differently.
 
 **Register them** in `SecurityConfig`:
 
@@ -1000,12 +936,9 @@ proxy access logs, which routinely record headers.
     }
 ```
 
-**`Authentication authentication` as a parameter — where does it come from?** Not from the request
-body. Spring MVC has an argument resolver that pulls it out of `SecurityContextHolder` — the
-`ThreadLocal` your filter populated a few milliseconds earlier, on this same thread.
+**Where does `Authentication authentication` come from?** Spring reads it from `SecurityContextHolder`, which the filter filled earlier on the same request thread. It does not come from the request body.
 
-**That parameter is the whole chapter in one line.** Filter → context → thread-local → resolver →
-controller. If `/me` returns your email, every piece of it works.
+The path is: filter identifies the user → security context stores the user → Spring supplies that user to the controller. If `/me` returns your email, those pieces are connected correctly.
 
 ## Step 14 — Method-level security
 
@@ -1048,11 +981,9 @@ which applies here exactly as it does to `@Transactional`.**
     }
 ```
 
-**`revokeAllForUser` on a permission change is the subtle, important part.** The user's existing tokens
-carry the *old* roles. Forcing a re-login means the new role takes effect immediately rather than
-whenever their refresh happens to come round.
+**Why call `revokeAllForUser` after a permission change?** Existing tokens still contain the old roles. Revoking refresh tokens forces a new login when a new token is needed. Already issued access tokens keep their old roles until expiry; revoking refresh tokens alone does not cancel them immediately.
 
-The same logic runs in reverse and matters far more: when you **remove** a role, stale tokens mean the
+The same logic runs in reverse and matters far more: when you **remove** a role, out of date tokens mean the
 user keeps a permission you believe you revoked. Revoking refresh tokens shrinks that window to the
 access-token lifetime. **This is the practical cost of stateless auth, and it is a favourite interview
 question.**
@@ -1146,7 +1077,7 @@ curl -i http://localhost:8081/api/v1/auth/me -H "Authorization: Bearer $HEAD.$FA
 log: `JWT signature does not match locally computed signature`.
 
 **Do this once with your own hands.** Reading "the signature protects it" is not the same as watching
-your forged admin token bounce.
+your faked admin token bounce.
 
 ### Drill 2 — expiry
 
@@ -1190,10 +1121,7 @@ Log in, keep the access token, log out with the refresh token, then call `/me` w
 
 **It still works.** For up to 15 minutes.
 
-That is not a bug in your code — it is the defining property of stateless authentication (concept A4).
-Refresh is dead, so no *new* access tokens can appear, but the one already issued cannot be recalled.
-Being able to explain this calmly, with the fix (short TTL, or `jti` blacklist and lose statelessness),
-is exactly the level of answer a senior interview is looking for.
+This is the limit of stateless access-token checks from A4. Logout prevents refreshes, but the existing access token remains valid until expiry. Shorter lifetimes reduce that window. A checked list of revoked `jti` values can close it earlier, at the cost of an extra lookup on each request.
 
 ### Drill 5 — the wrong token at the wrong endpoint
 
@@ -1204,7 +1132,7 @@ curl -i -X POST http://localhost:8081/api/v1/auth/refresh \
   -H "Content-Type: application/json" -d "{\"refreshToken\":\"$ACCESS\"}"
 ```
 
-`401` — no such row in `refresh_tokens`. Two independent defences did this: refresh tokens are opaque
+`401` — no such row in `refresh_tokens`. Two independent defences did this: refresh tokens are random and without readable data
 UUIDs looked up in a table, and access tokens carry `"type":"ACCESS"`. **Defence in depth**: either
 one alone would have held, and that is the point.
 
@@ -1219,33 +1147,28 @@ one alone would have held, and that is the point.
 | Forgot `chain.doFilter(...)` | Empty 200, no logs | Always continue the chain |
 | Two-arg `UsernamePasswordAuthenticationToken` | Context populated but still 403 | Use the three-arg constructor |
 | Secret shorter than 32 bytes | `WeakKeyException` at startup | `openssl rand -base64 48` |
-| Secret committed to Git | Anyone can mint admin tokens | Environment variable / secret manager |
+| Secret committed to Git | Anyone can create admin tokens | Environment variable / secret manager |
 | No `exp` claim | Tokens valid forever | Always set expiry |
 | Secrets inside the payload | Readable by anyone | Only non-sensitive claims |
 | Logging the token | Live credentials in log files | Log the subject, never the token |
 | `hasRole('ROLE_ADMIN')` | Always 403 | `hasRole` adds the prefix; use `hasAuthority` if you want it explicit |
 | Roles copied from the old token on refresh | Demoted users keep their rights | Re-read roles from the database |
 | No rotation | A stolen refresh token lasts for weeks | Rotate, and detect reuse |
-| `@Modifying` without `clearAutomatically` | Stale entities in the same transaction | Add it when you re-read them |
+| `@Modifying` without `clearAutomatically` | Out of date entities in the same transaction | Add it when you re-read them |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **RS256 with a JWKS endpoint** once more than one service verifies tokens (concept A2). Then only
-  auth-service can mint.
-- **Key rotation.** Keep a `kid` (key id) in the header so you can run two keys at once and retire the
-  old one gracefully. Nearly impossible to add later.
-- **Hash refresh tokens** before storing them (step 7 note).
-- **A cleanup job** for expired refresh rows — that table only grows. A nightly
-  `DELETE WHERE expires_at < now()` on the index you created in V2.
-- **Rate limit `/refresh` and `/login`**, per IP and per account.
-- **Cap concurrent sessions** per user if the product wants it — you have the table for it.
-- **Log security events** (login, failed login, refresh reuse, role change) to an audit table, not just
-  the application log.
-- **HTTPS only.** A bearer token on plain HTTP is a password shouted across the room.
-- **Where does the client keep the token?** `localStorage` is readable by any XSS; an httpOnly cookie
-  is not, but reintroduces CSRF (concept A4 in Phase 2a). There is no free option — pick and defend.
+- **Consider RS256 when several services verify tokens.** A **JWKS endpoint** publishes verification keys; only auth-service keeps the private signing key.
+- **Plan key rotation.** Put a `kid` (key id) in the header so verifiers can choose between an old and a new key during a change.
+- **Hash refresh tokens** before saving them, as explained in Step 7.
+- **Delete expired refresh rows regularly.** A nightly `DELETE WHERE expires_at < now()` can use the expiry index from V2.
+- **Rate limit `/refresh` and `/login`** for each IP address and account.
+- **Limit active sessions per user** if the product requires it. The refresh table records those sessions.
+- **Keep an audit table** for login failures, refresh-token reuse, and permission changes.
+- **Use HTTPS.** Without encrypted transport, someone on the network path may read bearer tokens.
+- **Choose client storage carefully.** `localStorage` is readable by injected JavaScript in an XSS attack. An httpOnly cookie cannot be read by JavaScript, but automatically sent cookies need CSRF protection. See Phase 2a.
 
 ---
 
@@ -1254,7 +1177,7 @@ one alone would have held, and that is the point.
 - [ ] Login returns `accessToken`, `refreshToken`, `tokenType`, `expiresIn`
 - [ ] You decoded your own token payload without any key
 - [ ] `/me` returns your email with a valid token, 401 without one
-- [ ] A tampered payload is rejected — you tried it
+- [ ] A changed without permission payload is rejected — you tried it
 - [ ] An expired token is rejected — you tried it with a 10-second TTL
 - [ ] A USER hitting the admin endpoint gets **403**, not 401, and you can say why
 - [ ] Refresh rotates the token; reusing the old one revokes every session

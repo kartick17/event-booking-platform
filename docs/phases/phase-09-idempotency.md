@@ -2,15 +2,36 @@
 
 **Time:** 3–4 hours
 **Needs:** Phase 8 finished.
-**Pre-reading:** HTTP method semantics — which methods are idempotent by definition, and why POST is
+**Pre-reading:** HTTP method meaning and behaviour — which methods are idempotent by definition, and why POST is
 not.
 
-This phase closes Phase 8's Drill 6, and it unlocks two things we deliberately postponed: safe retries
-on writes (Phase 7) and correct Kafka consumers (Phase 12).
+Phase 8 prevented competing seat updates from corrupting a count. This phase handles a different problem: **the same intended action arriving more than once**. It prepares for safer write retries and Kafka message handling.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase stops the same booking attempt from creating duplicate bookings. Requests can repeat because of a double-click, a retry, or a lost response.
+
+Example: the server saves a booking, but the reply never reaches the client. The client tries again. With the same idempotency key, the server recognises the earlier attempt and returns its result instead of making another booking.
+
+Words used in this phase:
+
+- **Idempotent:** repeating the same action has the same final effect as doing it once.
+- **Idempotency key:** a unique label for one intended action, reused for retries of that action.
+- **Deduplication:** recognising and skipping work already handled.
+- **Fingerprint:** a calculated value used to check whether two request bodies contain the same data.
+- **Unique constraint:** a database rule that stops duplicate values or value combinations.
+- **Lease:** a time limit for owning work marked as in progress.
+- **At-most-once:** do not repeat delivery; work may be lost.
+- **At-least-once:** work may be delivered again, so duplicates must be handled.
+- **Exactly-once effect:** the business change happens once even if processing is attempted more than once.
+
+Start by separating "one intended booking" from "one HTTP request." Several requests can represent the same intended booking.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. What idempotency means
 
@@ -23,11 +44,9 @@ DELETE user 7    idempotent — after the first, it is already gone
 INSERT booking   NOT idempotent — two rows
 ```
 
-**Idempotent is not the same as "returns the same response."** `DELETE /users/7` returns 204 the first
-time and 404 the second. Different responses, same **state**. State is what matters.
+**The response can differ even when the action is idempotent.** `DELETE /users/7` may return 204, then 404 when repeated. The user is still deleted after either attempt. The final saved state is what matters.
 
-**Safe** is a different property again: a safe method changes nothing at all. `GET` is safe. Every safe
-method is idempotent; the reverse is not true.
+**Safe** means the method does not request a business-data change. `GET` is safe. Deleting a user changes data, so it is not safe, even though repeating the same delete has the same final effect.
 
 | Method | Safe | Idempotent | Why |
 |---|---|---|---|
@@ -55,9 +74,7 @@ client ──POST /bookings──▶ booking-service
 1. The request never arrived. → retrying is correct.
 2. The request succeeded and the response was lost. → retrying creates a duplicate.
 
-**There is no way to distinguish them from the client side. None.** This is not a gap in HTTP; it is a
-property of unreliable networks — the Two Generals problem. You cannot make the network reliable, so
-you make the *operation* safe to repeat.
+**A missing reply does not tell the client what happened on the server.** Rather than assuming the first attempt failed, give retries a way to identify the same action. This makes repeating the action safe even when the network is unreliable.
 
 ### Everywhere a duplicate comes from
 
@@ -70,36 +87,29 @@ you make the *operation* safe to repeat.
 | Message broker | Kafka at-least-once delivery (Phase 10) |
 | Rebalance | a consumer crashes before committing its offset |
 
-**Six independent sources.** In a system with retries and a message broker, duplicates are not an edge
-case — they are the normal operating condition. Design for them.
+These are several independent ways a request can repeat. Retries and message delivery make duplicates normal enough that the application must be designed to handle them.
 
 ## A3. Delivery guarantees
 
 The vocabulary you need for Phase 10, and the reason idempotency comes first:
 
-**At-most-once** — send it, never retry. Fast, and messages can be lost. Fine for metrics, unacceptable
-for bookings.
+**At-most-once:** do not retry delivery. This avoids duplicate attempts, but a failed delivery can lose the work. That is unsuitable for a booking that must not disappear.
 
-**At-least-once** — retry until acknowledged. Nothing is lost, **duplicates happen**. This is what Kafka
-gives you by default and what almost every real system uses.
+**At-least-once:** retry or deliver again when acknowledgement is missing. A request or message may repeat. The application must recognise already completed work.
 
-**Exactly-once** — the message is processed once, no loss, no duplicates.
+**Exactly-once effect:** the intended change is applied once. This needs a clearly defined boundary, such as one database transaction, and protection against repeating the change.
 
-**"Exactly-once delivery" is not achievable** over an unreliable network — the same Two Generals result.
-What *is* achievable is **exactly-once processing**: at-least-once delivery plus an idempotent consumer.
+**Do not assume a message will arrive only once.** In this project, we allow repeat delivery and make the consumer check whether it has already completed the work. The duplicate check and business change must be saved together for the database effect to happen once.
 
 ```
 at-least-once delivery  +  idempotent consumer  =  effectively exactly-once
 ```
 
-**That equation is the answer to a very common interview question**, and it is why this phase must come
-before Kafka. Kafka's own "exactly-once semantics" is a transactional read-process-write within Kafka;
-it does not extend to your database side effects.
+Kafka's exactly-once support applies to supported transactions within Kafka. It does not automatically include your application's database changes. That is why we still need consumer-side duplicate protection.
 
 ## A4. Idempotency keys
 
-**The client generates a unique id for the *intent* and sends it with the request.** The server records
-which keys it has already handled.
+**The client gives one intended action a unique label.** It sends that label with every retry. The server records the label and the result so it can recognise later attempts.
 
 ```
 POST /api/v1/bookings
@@ -112,13 +122,9 @@ first request  → process it, store (key → result), return 201
 same key again → do not process, return the stored 201
 ```
 
-**The key must identify the intent, not the request.** One key per "book two seats for event 1", reused
-across every retry of that intent. A new booking gets a new key. Generate it when the user opens the
-form, not when the button is clicked — otherwise a double-click produces two keys and you are back where
-you started.
+**Reuse a key only for the same intended booking.** Generate it when the form is opened, and keep it for retries and double-clicks. A genuinely new booking gets a new key. Generating a new key on every click would make a double-click look like two separate actions.
 
-This is exactly how Stripe, PayPal and Adyen do it. `Idempotency-Key` is the de facto standard header
-name; there is an IETF draft standardising it.
+`Idempotency-Key` is a commonly used header name for this pattern. Payment APIs also use idempotency keys so a repeated request does not repeat the intended payment.
 
 ### What must be stored
 
@@ -133,30 +139,23 @@ name; there is an IETF draft standardising it.
 
 ### The three hard cases
 
-**1. Two requests with the same key arrive at the same moment.** Both check, both find nothing, both
-process. **A check-then-act race — Phase 8 all over again.** The fix is the same: a `UNIQUE` constraint
-on the key. One `INSERT` wins; the loser gets a constraint violation and knows a sibling is in flight.
+**1. The same key arrives twice at once.** Both requests could check before either saves. A database `UNIQUE` constraint lets only one insert succeed. The other request learns that the action is already recorded or in progress.
 
-**2. The same key with a *different* body.** The client has a bug, or is reusing keys. Returning the
-first response would be wrong — they asked for something else. Return **422 Unprocessable Entity** and
-say the key was reused with different parameters. The `request_fingerprint` column exists for this.
+**2. The same key arrives with different request data.** It no longer describes the same action. Return **422 Unprocessable Entity** rather than reuse the first result. The `request_fingerprint` stores a value used to compare the request data.
 
-**3. The first attempt crashed halfway.** The row sits at `IN_PROGRESS` forever and the key is
-permanently poisoned. Fix: a short lease — if `IN_PROGRESS` is older than N seconds, allow a retake.
+**3. The first process crashes while work is in progress.** An `IN_PROGRESS` record could stay forever. A lease gives it a time limit so the system can identify work that needs recovery. Recovering must still account for any business change that may already have happened.
 
 ### Natural idempotency — usually better
 
-Before building a key table, ask whether the data already contains a natural unique identity.
+First ask whether an existing business identifier can prevent duplicates. You may not need a separate key table.
 
 ```sql
 CONSTRAINT uk_one_booking_per_intent UNIQUE (user_id, event_id, client_reference)
 ```
 
-If a business rule says "one active booking per user per event", **a unique constraint gives you
-idempotency for free** — no extra table, no expiry job, enforced by the database.
+If the business allows only one active booking for a given user and event, a matching unique constraint can prevent a second active record. You still need to handle the duplicate attempt and return the appropriate result.
 
-**Prefer natural keys when they exist.** Use the idempotency-key table when the same intent may
-legitimately be repeated later (a user genuinely booking the same event twice), which is our case.
+Use an existing unique business identifier where it fits the rules. Use a separate idempotency key when the user may legitimately make another booking for the same event later, as in our project.
 
 ---
 
@@ -186,9 +185,7 @@ CREATE TABLE idempotency_keys (
 CREATE INDEX idx_idempotency_expires_at ON idempotency_keys (expires_at);
 ```
 
-**The `UNIQUE (idempotency_key, user_id)` constraint is the mechanism, not a nicety.** It is what makes
-concurrent duplicates safe: two simultaneous inserts, one wins, one gets a
-`DataIntegrityViolationException`. Concept A4, case 1.
+**`UNIQUE (idempotency_key, user_id)` prevents two records for the same user and key.** If two inserts overlap, only one succeeds; the other gets a `DataIntegrityViolationException`. A Java check before the insert is not enough.
 
 **Scoped by user**, so one user cannot guess another's key and read their response — a small but real
 information leak if you skip it.
@@ -196,9 +193,7 @@ information leak if you skip it.
 **`expires_at` plus its index**, because this table grows forever otherwise, and the cleanup job needs
 that index to stay fast (Phase 2b said the same about refresh tokens).
 
-`response_body TEXT` stores the original JSON so a replay is byte-identical. `booking_ref` is
-denormalised for convenience — a replay can rebuild the response from the booking if you prefer that
-over storing JSON.
+`response_body TEXT` keeps the original JSON so the same result can be returned on a retry. `booking_ref` also records which booking was created. An alternative is to rebuild the response from that booking rather than store the JSON.
 
 ## Step 2 — Entity
 
@@ -266,7 +261,7 @@ public class IdempotencyRecord {
 ```
 
 **A record starts as `IN_PROGRESS`, written *before* the work begins.** That ordering is deliberate: it
-claims the key, so a concurrent request with the same key hits the unique constraint instead of
+claims the key, so a happening at the same time request with the same key hits the unique constraint instead of
 processing in parallel.
 
 **Then the completion methods:**
@@ -299,14 +294,9 @@ processing in parallel.
 
 (Add getters.)
 
-**`isStale` is concept A4, case 3.** If the process died between claiming the key and completing, the
-row is stuck `IN_PROGRESS`. Without this, that key is poisoned forever and the user can never complete
-their booking. A 60-second lease means a crashed attempt self-heals.
+**`isStale` finds old `IN_PROGRESS` claims.** A crash may leave a key claimed without a final result. The 60-second lease lets recovery identify an abandoned attempt. It is still necessary to check whether any business work already completed before deciding what to retry.
 
-**`FAILED` and `COMPLETED` are kept separate on purpose.** A failed attempt should be **retryable** —
-the booking did not happen, so let them try again. Only successes are replayed. Storing an error
-response and replaying it forever would be a bug: a transient failure would become permanent for that
-key.
+**Keep `FAILED` separate from `COMPLETED`.** A temporary failure should allow a later attempt when it is safe. Completed attempts return the saved result. Do not make a temporary error permanent by returning it forever for that key.
 
 ## Step 3 — Repository
 
@@ -384,9 +374,7 @@ public class IdempotencyService {
     }
 ```
 
-`payload.toString()` works because our request DTOs are **records**, whose generated `toString` includes
-every component in a stable order. For a class, you would serialise to canonical JSON instead —
-`toString` on a plain class is an object hash and would change every run, breaking replay entirely.
+Our request DTOs are Java records. Their generated `payload.toString()` includes all components in a defined order, so this example uses it for the fingerprint input. For an ordinary class, use a stable JSON representation instead: the default `toString` is not a reliable description of the request data.
 
 **24-hour TTL:** long enough for any realistic client retry, short enough that the table stays small.
 Stripe uses 24 hours too.
@@ -436,22 +424,13 @@ Stripe uses 24 hours too.
 
 **Read the `catch` block first — it is the reason this works.**
 
-The `findBy...` above it is an optimisation for the common case. It is **not** the safety mechanism,
-because two concurrent requests can both find nothing. The `UNIQUE (idempotency_key, user_id)`
-constraint is what actually serialises them: one `INSERT` succeeds, the other throws.
+**The earlier `findBy...` check saves work in the usual case.** It is not the duplicate protection: two requests can both find nothing. The `UNIQUE (idempotency_key, user_id)` database rule lets only one matching `INSERT` succeed.
 
-**This is Phase 2a's pattern for the third time:** *check in code for a good message, constrain in the
-database for correctness.* Once you see it in three different contexts it stops being a rule and becomes
-an instinct.
+**The same rule appears again:** check in Java for a helpful message, then use a database constraint to protect against overlapping requests.
 
-**`saveAndFlush`, not `save`.** `save` only queues the insert; the constraint violation would then
-surface at commit time, outside this `try`. Flushing forces the SQL now, so the exception lands where we
-can handle it. **A genuinely easy mistake with a confusing symptom.**
+**`saveAndFlush` sends SQL now.** A normal `save` can delay the insert until commit, so the uniqueness error may occur after this `try` block. Flushing makes that error appear where this example expects to handle it.
 
-**`REQUIRES_NEW` suspends the caller's transaction and runs this in its own.** That matters: the claim
-must be committed *independently*, so that if the booking work later rolls back, the key record still
-exists to record the failure. Sharing a transaction would roll the claim back too, and the whole
-mechanism would evaporate exactly when it is needed.
+**`REQUIRES_NEW` starts a separate transaction.** The key claim must stay recorded even if the later booking transaction fails. Sharing the booking transaction would roll the claim back too, leaving no saved attempt to mark as failed.
 
 **Then completion:**
 
@@ -508,9 +487,7 @@ with it.
 **The shape to remember: claim → replay-or-work → record the outcome.** Every idempotent endpoint you
 ever write has this structure.
 
-The `catch` marks the record `FAILED` rather than deleting it, which preserves the fingerprint. A retry
-with the same key and the same body is allowed through; the same key with a *different* body is still
-correctly rejected as reuse.
+The `catch` marks the record `FAILED` and keeps its fingerprint. This allows a retry with the same key and body, while still rejecting the same key used for different data.
 
 **File:** `.../api/dto/BookingResult.java`
 
@@ -563,11 +540,7 @@ public record BookingResult(int status, String rawBody, Booking booking, boolean
     }
 ```
 
-**Requiring the header is a deliberate choice with a real cost:** it is a breaking API change for any
-existing client. The alternatives are to make it optional (and lose the guarantee for clients that
-forget) or to version the endpoint. **For a payment or booking API, requiring it is correct** —
-Stripe requires it for exactly this reason. Say the trade-off out loud rather than pretending it is
-free.
+**Requiring the header changes the client agreement.** Existing clients must start sending it. Making it optional leaves callers without it unprotected; a new endpoint version is another option. This booking API chooses to require it, so document that requirement clearly.
 
 **`Idempotent-Replay: true` on a replayed response** so clients and your own logs can tell a replay from
 a fresh creation. Without it, debugging "why did this only create one booking?" is guesswork.
@@ -644,10 +617,7 @@ later.
 **`0 17 3` — 03:17, not 03:00.** Every scheduled job in the world runs at the top of the hour; offset
 minutes spread the load. Small habit, real benefit.
 
-**In production this needs a distributed lock** (Phase 8, step 6) or ShedLock, or all three instances
-run it simultaneously. Here the work is idempotent — deleting an already-deleted row is harmless — so
-the duplication is wasteful rather than wrong. **Notice that idempotency is what makes the duplicate
-run safe.** The concept applies to your own jobs, not just to user requests.
+**Several application instances may run this cleanup at once.** A distributed lock or ShedLock can limit it to one runner. Here, repeated deletion is harmless because already deleted rows stay deleted. Without a lock the extra runs waste work, but do not repeat a business change.
 
 ## Step 8 — Idempotent consumers, prepared for Phase 12
 
@@ -801,7 +771,7 @@ docker exec -it ebp-postgres psql -U ebp -d booking_db \
   -c "SELECT idempotency_key, status FROM idempotency_keys ORDER BY id DESC LIMIT 1;"
 ```
 
-**A failed attempt must not poison the key**, or a transient downstream blip would permanently block
+**A failed attempt must not poison the key**, or a temporary downstream blip would permanently block
 that user's booking. This is why `FAILED` and `COMPLETED` are separate states.
 
 ### Drill 4 — the stale lease
@@ -816,10 +786,10 @@ docker exec -it ebp-postgres psql -U ebp -d booking_db -c \
          NOW() - INTERVAL '5 minutes', NOW() + INTERVAL '1 day');"
 ```
 
-Now book with `Idempotency-Key: stuck-key`. It **succeeds**, and the log says *Reclaiming stale
+Now book with `Idempotency-Key: stuck-key`. It **succeeds**, and the log says *Reclaiming out of date
 idempotency key*.
 
-Now set `created_at` to `NOW()` and try again: `409`, because a sibling request is genuinely in flight.
+Now set `created_at` to `NOW()` and try again: `409`, because a sibling request is really in flight.
 
 **Without the lease, `stuck-key` would be dead forever.** Any mechanism that can get stuck needs a
 timeout — the same lesson as Phase 8's lock TTL and Phase 1's Eureka lease. **This pattern repeats
@@ -855,35 +825,30 @@ weaker, but no client change needed. **Both are defensible; drifting into one by
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Check-then-insert with no unique constraint | Concurrent duplicates still get through | `UNIQUE (key, user_id)` |
+| Check-then-insert with no unique constraint | Happening at the same time duplicates still get through | `UNIQUE (key, user_id)` |
 | `save` instead of `saveAndFlush` | The constraint violation escapes your `try` | Flush to force the SQL |
 | Key claim in the caller's transaction | Rolls back with the work; mechanism disappears | `REQUIRES_NEW` |
 | No request fingerprint | Same key, different data returns the wrong response | Hash the body |
-| Replaying `FAILED` responses | A transient error becomes permanent | Replay only `COMPLETED` |
-| No lease on `IN_PROGRESS` | A crash poisons the key forever | Stale reclaim |
+| Replaying `FAILED` responses | A temporary error becomes permanent | Replay only `COMPLETED` |
+| No lease on `IN_PROGRESS` | A crash poisons the key forever | Out of date reclaim |
 | Keys not scoped by user | One user reads another's response | Include `user_id` |
 | No expiry or cleanup | The table grows without bound | TTL + indexed cleanup job |
-| Fingerprinting a non-record class | `toString` differs every run; replay never matches | Canonical JSON |
+| Fingerprinting a non-record class | `toString` differs every run; replay never matches | Standard JSON |
 | Dedup row committed separately from the work | Message marked done, work never happened | One transaction |
 | Server-generated keys | Retries get different keys; no protection | The client owns the key |
 | One key per click | A double-click makes two keys | One key per **intent** |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Document the header.** Clients must know to send it, keep it across retries, and generate a new one
-  per intent.
-- **Store the response body**, not just "done" — a replay must return the original answer, not a
-  reconstruction that may have drifted.
-- **Consider Redis** for the key store if the write rate is very high — with the same unique-claim
-  semantics (`SET NX`) and a TTL. The database is simpler and transactional, which is why we used it.
-- **Metrics:** replay rate, conflict rate, stale reclaims. A rising replay rate means clients are
-  retrying, which means something upstream is timing out.
-- **Prefer a natural unique constraint** where the business allows it (concept A4). Less machinery.
-- **Idempotency does not replace locking.** Phase 8 solves "two users, one seat"; Phase 9 solves "one
-  user, two requests". **You need both**, and knowing which problem you are looking at is the skill.
-- **Apply it to consumers too** (step 8) — that table is load-bearing for Phase 12.
+- **Document how clients use the header:** keep one key for retries of the same action and create a new key for a new action.
+- **Save the response body** so the repeated request can receive the original result. Rebuilding it later could show changed data.
+- **Consider Redis only if measurements justify it.** A key store there needs an atomic claim such as `SET NX` and expiry. The local database makes transaction handling simpler in this project.
+- **Measure repeats, conflicts, and reclaimed old claims.** More repeats can indicate timeouts or client retries.
+- **Use a natural unique business rule when it fits**, as discussed in A4. This can reduce extra key-handling code.
+- **Keep both locking and duplicate protection.** Phase 8 handles different requests competing for seats; Phase 9 handles repeated attempts for the same action.
+- **Apply duplicate checks to message consumers too.** The saved message-id table is required for the saga in Phase 12.
 
 ---
 
@@ -891,10 +856,10 @@ weaker, but no client change needed. **Both are defensible; drifting into one by
 
 - [ ] The same key twice returns the same booking reference with `Idempotent-Replay: true`
 - [ ] Only one booking row and one seat deduction exist
-- [ ] The concurrent double-click produces one booking and one 409
+- [ ] The happening at the same time double-click produces one booking and one 409
 - [ ] The same key with different data is rejected
 - [ ] A failed attempt can be retried with the same key
-- [ ] A stale `IN_PROGRESS` record is reclaimed after the lease
+- [ ] A out of date `IN_PROGRESS` record is reclaimed after the lease
 - [ ] The cleanup job deletes expired keys
 - [ ] `processed_messages` exists in both services
 - [ ] You can explain why the claim uses `REQUIRES_NEW`

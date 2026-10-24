@@ -4,12 +4,33 @@
 **Needs:** Phase 7 finished.
 **Pre-reading:** database isolation levels; the lost-update problem.
 
-This phase is where a booking system is won or lost. Everything so far has been about structure.
-This is about **being correct when two people click at the same millisecond**.
+This phase checks that seat counts stay correct **when several people book at the same time**. A method can work perfectly for one request and still give the wrong result when two requests overlap.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase prevents selling the same last seat to two people. The problem appears when requests overlap: both read the old count before either finishes updating it.
+
+Example: only 1 seat remains. Two requests both read 1 and both decide to reserve it. Checking the number in Java is not enough; the database update must also protect against a competing change.
+
+Words used in this phase:
+
+- **Concurrency:** more than one operation is in progress at the same time.
+- **Race condition:** the result changes depending on which overlapping operation happens first.
+- **Critical section:** the part of the code that needs protection from competing changes.
+- **Isolation level:** database rules about what one transaction can see of another transaction's work.
+- **Optimistic lock:** check whether the row changed since it was read, using a version number.
+- **Pessimistic lock:** take a database lock before changing the row; competing changes wait.
+- **Atomic update:** one protected database operation that checks and changes the value together.
+- **Distributed lock:** a lock shared by several application instances, often through another system such as Redis.
+- **Deadlock:** two transactions each wait for a lock held by the other.
+
+Start with the last-seat example. Then compare the three database approaches using the same test, as the build steps describe.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. The race condition, drawn out
 
@@ -30,10 +51,9 @@ t8                                     INSERT booking (1 seat)
         Result: 2 bookings. 1 seat. available_seats = 0.
 ```
 
-**Both threads were correct in isolation.** Both read a true value, both made a valid decision. The bug
-is in the *gap* between reading and writing — the window where the value can change underneath you.
+**Each request made sense on its own.** Both saw 1 seat. The problem was the gap between reading that count and writing the new count. Another request can change the data during that gap.
 
-This shape is called **read–modify–write**, and it is the source of most concurrency bugs:
+This is called **read–modify–write**: read a value, calculate a new one in the application, then save it. Other work can happen between those steps:
 
 ```java
 int seats = event.getAvailableSeats();   // READ
@@ -43,12 +63,11 @@ if (seats >= qty) {                       // decide on a value that may already 
 }
 ```
 
-The **critical section** is everything between the read and the write. Making that section safe is the
-whole job.
+The code between reading and writing is the **critical section**. We need to protect it or replace it with one database operation.
 
 ## A2. Why isolation levels do not save you by default
 
-You would hope a transaction fixes it. Mostly, it does not.
+A transaction groups changes together, but does not automatically prevent every conflict with another transaction. Its isolation level and the update method matter.
 
 | Level | Dirty read | Non-repeatable read | Phantom | Lost update |
 |---|---|---|---|---|
@@ -66,20 +85,15 @@ The anomalies in plain words:
 - **Lost update** — two transactions read, both modify, and the second overwrites the first. **This is
   our bug.**
 
-**READ COMMITTED — the default in Postgres, Oracle and SQL Server — does not prevent lost updates.**
-Each `SELECT` sees a fresh, committed snapshot, which is exactly why both threads read `1`.
+**READ COMMITTED** is the usual default in Postgres, Oracle, and SQL Server. It prevents reading uncommitted data, but the read–modify–write code shown here can still lose an update: both requests may read `1` before either saves.
 
-**Postgres uses MVCC** (multi-version concurrency control): writers create new row versions instead of
-blocking readers. Excellent for throughput, and it means **readers are never blocked, so nothing warns
-you that your read is about to go stale**.
+**MVCC (multi-version concurrency control)** lets Postgres keep different versions of rows. Ordinary reads can see a committed version without waiting for a writer. This helps performance, but a value read earlier may be out of date when the application later writes.
 
-Raising the level to `REPEATABLE READ` does work in Postgres — the second transaction fails with a
-serialization error. But it applies to the whole transaction, costs throughput, and forces you to handle
-retries anyway. **Better to solve it precisely, at the row.**
+Postgres can reject the competing update at `REPEATABLE READ`, but the application must then handle that transaction failure. Here we compare methods that protect the particular seat row rather than changing the isolation level for all the work.
 
 ## A3. Optimistic locking
 
-**Assume conflicts are rare.** Do not lock. Detect the conflict at write time and fail.
+**Optimistic locking assumes collisions are uncommon.** Read normally, then check at update time whether someone else changed the row. If they did, reject this update.
 
 A `version` column, checked on every update:
 
@@ -89,8 +103,7 @@ UPDATE events
  WHERE id = 1 AND version = 5;
 ```
 
-If another transaction already bumped the version to 6, this matches **zero rows**. Hibernate counts the
-affected rows, sees 0, and throws `OptimisticLockException`.
+If another transaction has already changed the version to 6, this update matches **zero rows**. Hibernate notices that nothing was updated and throws `OptimisticLockException`.
 
 ```
 Thread A: read version=5        Thread B: read version=5
@@ -101,23 +114,20 @@ Thread B: UPDATE ... version=5 → 0 rows ✗  OptimisticLockException
 **This already works in our project.** `@Version` went into the `Event` entity in Phase 4, and Phase 6's
 Drill 5 saw it fire without us naming it.
 
-**Right when:** conflicts are rare, transactions are short, you can retry.
-**Wrong when:** conflicts are common — you spend all your time retrying, and under heavy contention it
-degrades badly.
+**Useful when:** competing changes are uncommon and transactions are short.
+**Less useful when:** many requests keep changing the same row, because failures and retries add more work.
 
-**Non-negotiable:** if you use optimistic locking, **you must handle the failure**. An unhandled
-`OptimisticLockException` reaching the user as a 500 is a bug, not a design.
+**Handle the conflict.** Do not let an expected `OptimisticLockException` become an unexplained 500 response. Decide whether to return a conflict or retry safely.
 
 ## A4. Pessimistic locking
 
-**Assume conflicts are likely.** Take the lock first; everyone else waits.
+**Pessimistic locking assumes collisions are likely.** Lock the row first. Other transactions needing a conflicting lock must wait.
 
 ```sql
 SELECT * FROM events WHERE id = 1 FOR UPDATE;
 ```
 
-The row is locked until the transaction ends. Other transactions attempting `FOR UPDATE` on that row
-**block**.
+The row stays locked until the transaction commits or rolls back. Another `FOR UPDATE` on the same row waits for that lock to be released.
 
 ```
 Thread A: SELECT ... FOR UPDATE  → gets the lock
@@ -128,22 +138,17 @@ Thread B: (unblocks) reads the NEW value → decides correctly
 
 Correct, and easy to reason about. The costs are real:
 
-- **Throughput.** Reservations on one hot event serialise completely.
-- **Deadlocks.** A locks row 1 then row 2; B locks row 2 then row 1. Both wait forever. Postgres detects
-  it and kills one with a deadlock error. **Prevention: always take locks in a consistent order** (for
-  example, ascending id).
-- **Holding a lock across a network call is a disaster.** A lock held for a 2-second Feign call blocks
-  every other booking for 2 seconds. Phase 6 said never hold a transaction across a remote call; with
-  a lock it is far worse.
-- **You must set a timeout.** Otherwise a stuck transaction blocks everyone indefinitely.
+- **Less parallel work:** reservations for the same popular event must wait their turn.
+- **Deadlocks:** A holds row 1 and wants row 2, while B holds row 2 and wants row 1. Postgres detects the cycle and stops one transaction. Take locks in the same order, such as increasing id, to reduce this risk.
+- **Long waits:** making an HTTP call while holding the lock makes other bookings wait for the network too. Keep the locked transaction short.
+- **Timeouts:** set a waiting limit so one stuck transaction cannot hold everyone indefinitely.
 
 `PESSIMISTIC_WRITE` is an exclusive lock (nobody else reads-for-update or writes). `PESSIMISTIC_READ`
 is shared (others may read, nobody may write).
 
 ## A5. The atomic update — usually the best answer
 
-Both approaches above are read–modify–write with a guard. **The third option removes the gap
-entirely:**
+The earlier methods protect separate read and write steps. **An atomic update combines the condition and change into one SQL statement:**
 
 ```sql
 UPDATE events
@@ -154,37 +159,28 @@ UPDATE events
    AND status = 'PUBLISHED';
 ```
 
-**One statement. The database reads and writes atomically.** The row is locked internally for the
-duration of the statement — microseconds — and `available_seats - :quantity` is computed from the
-*current* value, not one your application read earlier.
+**The database checks and updates together.** It subtracts from the current saved value and protects the row while doing so. The calculation does not use an older value previously read into Java.
 
-Check the affected row count:
-- **1 row** → reserved.
-- **0 rows** → not enough seats, or not published. No exception, no retry, no lock held.
+Check how many rows the statement changed:
+- **1 row:** the reservation succeeded.
+- **0 rows:** the conditions did not match, such as too few seats or an unpublished event. No seats were changed.
 
 | | Optimistic | Pessimistic | Atomic UPDATE |
 |---|---|---|---|
 | Blocking | none | yes | microseconds |
 | Retries needed | yes | no | no |
 | Deadlock risk | none | yes | none |
-| Throughput under contention | poor | poor | **best** |
+| Work completed per second under requests competing for the same resource | poor | poor | **best** |
 | Works for complex multi-field logic | yes | yes | **no** |
 | Business rules in Java | yes | yes | **no — they move into SQL** |
 
-**The trade is real and worth stating:** the atomic update is fastest and simplest, but the rule
-(`available_seats >= quantity AND status = 'PUBLISHED'`) now lives in SQL rather than in your aggregate.
-That is a genuine loss — it is the invariant we deliberately put inside `Event.reserveSeats()` in
-Phase 4.
+**The cost:** the seat rule now also appears in SQL: `available_seats >= quantity AND status = 'PUBLISHED'`. Keep it consistent with the rule expressed by `Event.reserveSeats()` from Phase 4.
 
-**Our decision:** keep the aggregate as the place the rules are *expressed*, and use the atomic update
-as the enforcement mechanism for the one hot field. We will implement all three so you can measure
-them, then choose.
+**Our approach:** keep the Event object's rules clear, and use the atomic SQL update to protect this frequently changed count. Implement all three approaches in the existing steps so you can compare their behaviour.
 
 ## A6. Distributed locks, and why we do not need one here
 
-Everything above relies on **one database row** being the single point of truth. When the resource is
-not in a database — a file, an external API, a scheduled job that must run on exactly one instance —
-there is no row to lock, and you need a lock that all instances can see.
+A database can protect its own row. But a task such as updating a shared file or running one scheduled job across several instances may have no row to lock. Then the instances may need a lock they can all see.
 
 The Redis version:
 
@@ -192,26 +188,17 @@ The Redis version:
 SET lock:event:1 <random-token> NX PX 5000
 ```
 
-- `NX` — set only if it does not exist. Atomic, because Redis is single-threaded (Phase 5, concept A5).
-- `PX 5000` — expire after 5 seconds. **Without a TTL, a crashed holder locks the resource forever.**
-- The random token identifies the owner, so you only delete *your own* lock — and the delete must be a
-  Lua script that compares and deletes atomically, or you can delete a lock that already expired and was
-  taken by someone else.
+- `NX` creates the key only if it does not already exist. Redis checks and sets it as one operation.
+- `PX 5000` expires the key after 5 seconds. Otherwise a crashed lock holder could leave the resource locked indefinitely.
+- The random token identifies the owner. Release must check the token and delete the key in one Lua script. Separate operations could accidentally delete a lock that expired and was acquired by someone else.
 
-**Redlock** is the multi-node algorithm. It is genuinely contested: Martin Kleppmann's critique argues
-it is unsafe under GC pauses and clock drift; Salvatore Sanfilippo (Redis's author) disagrees. **Know
-that the debate exists** — mentioning it is a strong senior signal.
+**Redlock** is an approach using several Redis nodes. Its safety under long pauses and clock differences has been debated, including by Martin Kleppmann and Redis creator Salvatore Sanfilippo. The important lesson is to understand a lock's assumptions before relying on it for correctness.
 
-**The fundamental limit:** a lock with a TTL can expire while you still believe you hold it — a long GC
-pause is enough. The safe pattern is a **fencing token**: an ever-increasing number handed out with the
-lock, which the protected resource checks and rejects if it is lower than one it has already seen.
+**A timed lock can expire while the old holder is still working.** A **fencing token** helps detect this: every new lock gets a larger number, and the protected resource rejects work carrying an older number. The resource must actually check the token for this to help.
 
-**For seat reservation, all of this is unnecessary and worse.** The database row *is* the shared
-resource, and the database already provides atomicity. **A distributed lock in front of a database row
-is slower, adds a dependency, and introduces failure modes the database does not have.**
+**Seat counts already have a shared database row.** Use the database's protection for that row. Adding Redis locking in front would add another dependency and new failure cases without replacing the need for correct database updates.
 
-Being able to say "we did not need a distributed lock here, and here is why" is worth more than being
-able to implement one.
+Choose a distributed lock only when the resource and the required protection actually need one. Being able to explain that choice matters more than adding a lock everywhere.
 
 ---
 
@@ -237,10 +224,9 @@ from the `Event` entity (comment out the field and its column mapping):
     }
 ```
 
-The `sleep` is not cheating — it makes a real race reproducible instead of occasional. The window exists
-without it; on a fast machine you would just have to try a hundred times.
+The `sleep` makes the overlap easier to reproduce. The gap also exists without a sleep, but you may need more attempts to observe it on a fast computer.
 
-Set up an event with exactly 5 seats and fire 20 concurrent reservations:
+Set up an event with exactly 5 seats and fire 20 happening at the same time reservations:
 
 ```bash
 docker exec -it ebp-postgres psql -U ebp -d event_db \
@@ -267,10 +253,7 @@ docker exec -it ebp-postgres psql -U ebp -d event_db \
 
 **Negative seats.** Seventeen people hold tickets for five chairs.
 
-**And notice what did not save you:** the `CHECK (available_seats >= 0)` constraint from Phase 4 *should*
-have. It did not, because each transaction's own view satisfied it — Hibernate wrote `4`, then another
-wrote `4`, each starting from a stale read of `5`. **Constraints validate the value being written, not
-the arithmetic that produced it.**
+**A non-negative check cannot detect this lost update.** Two requests read `5` and both write `4`. Each saved value passes `CHECK (available_seats >= 0)`, but two reservations reduced the count only once. A constraint checks the value being saved, not whether the application calculated it from a fresh read.
 
 **This is a real production bug in a real booking system**, and you just created it in ten seconds.
 Restore `@Version` and the proper method before continuing.
@@ -320,16 +303,9 @@ ourselves. Add `spring-retry` and `starter-aop` to event-service:
 
 **Three details that are easy to get wrong:**
 
-**`@Retryable` must sit *outside* `@Transactional`** in the proxy order, so each attempt gets a **fresh
-transaction and a fresh read**. Retrying inside the same transaction re-reads the same stale snapshot
-and fails identically forever. Spring Retry's aspect has a lower order by default, so this works — but
-if you ever see a retry loop that always fails the same way, this ordering is the first thing to check.
+**Each retry needs a new transaction and fresh read.** Put `@Retryable` outside `@Transactional` in the wrapper order. Retrying inside the same transaction can reuse the failed transaction or old state. Spring Retry normally provides the needed order; check it if every attempt repeats the same failure.
 
-**Retry is safe here** because this operation is *conditionally* idempotent in the useful sense: the
-failed attempt changed nothing (its update matched zero rows), so re-running it is not a duplicate.
-Contrast with Phase 7's drill, where the write **had** committed and only the response was lost. **The
-difference between "definitely did not happen" and "might have happened" is what decides whether retry
-is safe.**
+**Retry is safe for this rejected optimistic update because it did not commit a change.** The next attempt gets fresh data. That is different from retrying an HTTP write after a timeout, where the remote change may already have committed.
 
 **`random = true`** — jitter, for the same reason as Phase 7.
 
@@ -364,9 +340,7 @@ Rerun the 20-request test: mostly `201` and `409`, **no 500s, and `available_sea
 `spring.jpa.properties.hibernate.format_sql: true` and `logging.level.org.hibernate.SQL: DEBUG` and read
 it yourself — seeing `for update` in the log is worth more than being told about it.
 
-**The lock timeout is the line people forget.** Without it, a transaction that hangs blocks every other
-reservation for that event indefinitely. Three seconds, then fail with a clear error. In Postgres you
-can also set `lock_timeout` at the session level.
+**Set a lock waiting limit.** Otherwise a stuck transaction can make every competing reservation wait without an end. The example allows 3 seconds, then returns an error. Postgres also provides a session-level `lock_timeout`.
 
 **Two rules that come with pessimistic locking, and both are absolute:**
 
@@ -420,16 +394,9 @@ can also set `lock_timeout` at the session level.
 - The `WHERE available_seats >= :quantity` clause is evaluated by the database **against the live row**,
   under its own internal lock.
 
-**The two annotation flags matter.** `flushAutomatically = true` pushes pending changes to the database
-before this native query runs, so it does not operate on stale state. `clearAutomatically = true` clears
-the persistence context afterwards — otherwise Phase 2b's warning applies: entities already loaded keep
-their old `available_seats`, and the `getById` on the next line would return a **cached, stale object**.
+**The flags keep Java's tracked entities and the SQL update from disagreeing.** `flushAutomatically = true` sends pending entity changes to the database before the query. `clearAutomatically = true` clears tracked entities afterwards so the next `getById` does not reuse an old in-memory seat count.
 
-**The cost, stated honestly:** `available_seats >= :quantity AND status = 'PUBLISHED'` now lives in SQL,
-duplicating the rules in `Event.reserveSeats()`. Two places to change, and a native query that no
-compiler checks. **We accept it for this one hot field** because a booking platform that oversells is
-worthless, and a comment on the entity method points at the SQL. **Naming the trade-off is the skill;
-pretending there is none is not.**
+**Keep both versions of the seat rule in sync.** The SQL condition `available_seats >= :quantity AND status = 'PUBLISHED'` also appears in `Event.reserveSeats()`. Java compilation does not check the SQL rule for you. We accept the extra maintenance for this frequently updated count and document the connection.
 
 ## Step 5 — Measure all three
 
@@ -471,10 +438,10 @@ Typical shape of the results (your numbers will differ; the *ordering* is what m
 the baseline, and then you choose on cost.
 
 **The atomic update is several times faster** because it neither blocks nor retries. Under real
-contention the gap widens.
+requests competing for the same resource the gap widens.
 
 **Run each three times.** Optimistic locking's timing varies most, because it depends on how many
-retries happen — which is exactly its weakness under contention.
+retries happen — which is exactly its weakness under requests competing for the same resource.
 
 ## Step 6 — A distributed lock, for the cases that need one
 
@@ -528,9 +495,7 @@ public class RedisDistributedLock {
 
 **Every line here is defending against a specific failure:**
 
-**`setIfAbsent(key, token, ttl)` is one Redis command** (`SET key val NX PX ttl`), and Redis is
-single-threaded, so it is atomic. Doing it as `EXISTS` then `SET` would be a race — the exact bug this
-class exists to prevent.
+**Use one `setIfAbsent(key, token, ttl)` command**, equivalent to `SET key val NX PX ttl`. Separate `EXISTS` and `SET` commands leave a gap where two callers could both claim the same lock.
 
 **The TTL is mandatory.** If the holder crashes, the lock must expire on its own. **A lock with no TTL
 is a deadlock waiting for a crash.**
@@ -542,9 +507,7 @@ A acquires. A pauses (GC). Lock expires. B acquires.
 A resumes, calls DEL → deletes B's lock. Two holders. Total failure.
 ```
 
-**The release must be a Lua script**, because "check the token, then delete" is two operations, and the
-lock can expire between them. Redis runs a script atomically — Lua is not decoration here, it is the
-only correct way to do a compare-and-delete.
+**Release with one Lua script.** Checking the owner token and deleting the lock must happen together. If they are separate, the lock could expire and be acquired by someone else between the check and delete.
 
 **Usage, with the guarantee it cannot give you:**
 
@@ -560,10 +523,7 @@ try {
 }
 ```
 
-**Read that comment again.** If your critical section outruns the TTL, the lock expires while you are
-still working and someone else acquires it. **The lock does not stop you, and there is no way for it
-to.** A long GC pause is enough. The real fix is a **fencing token** the protected resource checks
-(concept A6) — which is why "just use a distributed lock" is not the simple answer people assume.
+**If work lasts longer than the TTL, the lock can expire while that work is still running.** A different process may then acquire it. A long Java memory-cleanup pause can cause this. A fencing token checked by the protected resource can reject old-owner work; a timed lock alone cannot.
 
 **Legitimate uses:** ensuring a scheduled job runs on one instance only; serialising access to a
 non-transactional external API; preventing a duplicate expensive computation (Phase 5's cache
@@ -620,21 +580,21 @@ while holding a lock.**
 
 ### Drill 4 — retry exhaustion
 
-Set `maxAttempts = 2` on the optimistic version and run 100 concurrent reservations. Many requests fail
+Set `maxAttempts = 2` on the optimistic version and run 100 happening at the same time reservations. Many requests fail
 with a conflict even though seats were available — they simply lost three races in a row.
 
-**This is optimistic locking's honest weakness:** under high contention it does not degrade gracefully,
+**This is optimistic locking's honest weakness:** under high requests competing for the same resource it does not degrade in a controlled way,
 it *fails* gracefully-ish. The atomic update has no such cliff, and comparing the two under the same
 load is the most persuasive argument for it.
 
 ### Drill 5 — the missing `clearAutomatically`
 
 Remove `clearAutomatically = true` from the atomic query and call reserve twice in one transaction. The
-second call reads a **stale** `available_seats` from the persistence context — Hibernate's first-level
+second call reads a **out of date** `available_seats` from the persistence context — Hibernate's first-level
 cache still holds the pre-update object.
 
 **A native query bypasses the persistence context.** Your entity and your database now disagree, with no
-error. Genuinely nasty, and now recognisable.
+error. Really nasty, and now recognisable.
 
 ### Drill 6 — the double-click
 
@@ -666,32 +626,26 @@ That needs **idempotency**, and it is Phase 9.
 | Relying on the default isolation level | Lost updates | READ COMMITTED does not prevent them |
 | Relying on a `CHECK` constraint | Negative values still appear | Constraints check values, not arithmetic |
 | `@Version` present but exception unhandled | 500s under load | Map to 409, or retry |
-| `@Retryable` inside the transaction | Retries re-read the same stale snapshot | Retry outside, fresh transaction each time |
+| `@Retryable` inside the transaction | Retries re-read the same out of date snapshot | Retry outside, fresh transaction each time |
 | Pessimistic lock with no timeout | Requests hang forever | `jakarta.persistence.lock.timeout` |
 | Locks taken in different orders | Deadlocks | Consistent order, always |
 | Remote call while holding a lock | Everyone blocked for the call duration | Never |
 | Distributed lock without TTL | A crash locks the resource forever | Always a TTL |
 | Deleting a lock without checking the token | You delete someone else's lock | Random token + Lua compare-and-delete |
-| Native `@Modifying` without `clearAutomatically` | Stale entities in the same transaction | Add both flags |
+| Native `@Modifying` without `clearAutomatically` | Out of date entities in the same transaction | Add both flags |
 | Distributed lock in front of a database row | Slower, extra dependency, new failure modes | Let the database do it |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Load-test the hot path.** Concurrency bugs are invisible at one request per second and obvious at a
-  thousand. `k6`, `wrk` or JMeter, before launch, not after.
-- **Alert on optimistic-lock retry rates.** A rising rate means contention is growing and you may need
-  to change approach.
-- **Watch for hot rows.** One popular event serialises everything. At extreme scale you shard the
-  counter (ten rows of 50 seats instead of one row of 500) and accept a more complex read.
-- **Reservation expiry:** real ticketing holds seats for ~10 minutes while the user pays, then releases
-  them. That needs a `reservations` table with `expires_at` and a cleanup job — not just a counter.
-- **Idempotency keys** (Phase 9) for the double-click.
-- **Log every seat movement** with a correlation id. When counts disagree, the log is the only way to
-  find out why.
-- **Reconciliation job:** periodically compare `capacity - sum(bookings)` against `available_seats`.
-  Distributed systems drift; you want to find out before a customer does.
+- **Test overlapping requests under load** using `k6`, `wrk`, or JMeter before launch. One request at a time will not expose these timing problems.
+- **Monitor optimistic-lock retry rates.** More retries mean more requests are competing for the same data.
+- **Find frequently updated rows.** At very large scale, a seat counter may be split into smaller counters, but correct totals and reservations then become more complex. Measure before making that change.
+- **Plan reservation expiry** if seats are held while a user pays. A `reservations` table with `expires_at` and a cleanup job can record those holds; a count alone cannot. A hold time such as 10 minutes is a product decision.
+- **Use idempotency keys from Phase 9** to handle repeated clicks for the same booking.
+- **Log seat changes with a correlation id** so unexpected counts can be investigated.
+- **Run a comparison job** between `capacity - sum(bookings)` and `available_seats`, using the correct booking quantities and statuses. Investigate differences rather than waiting for a user to report them.
 
 ---
 
@@ -720,5 +674,5 @@ Next: **idempotency.** Idempotency keys, the `idempotency_keys` table, what "saf
 means, and why this is the missing piece that makes Phase 7's retries safe on writes and Phase 12's
 Kafka consumers correct.
 
-**Pre-reading for Phase 9:** HTTP method semantics — which methods are idempotent by definition, and why
+**Pre-reading for Phase 9:** HTTP method meaning and behaviour — which methods are idempotent by definition, and why
 POST is not.

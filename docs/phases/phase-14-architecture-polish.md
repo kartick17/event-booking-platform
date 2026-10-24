@@ -4,12 +4,35 @@
 **Needs:** Phase 13 finished.
 **Pre-reading:** the ports-and-adapters diagram; aggregate root in one paragraph.
 
-The system works. This phase steps back, names what you built, refactors one service to make the
-structure explicit, and turns the whole project into something you can talk about.
+The system works. Now you will make one service's structure clearer, learn names for the design choices already used, and write down the reasons for those choices. This also helps you explain the project to someone else.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase makes the working code easier to organise, test, and explain. You will separate business rules from details such as HTTP, database storage, and Kafka. You will also record why important design choices were made.
+
+Example: the seat rule should be understandable without knowing how a database row is saved. The business code asks a storage interface to save an event. A separate implementation handles Postgres. Tests can supply a small in-memory implementation instead.
+
+Words used in this phase:
+
+- **Architecture:** how parts of the application are arranged and depend on each other.
+- **Refactor:** change code structure while keeping the intended behaviour.
+- **Domain:** the business objects and rules, such as events and seat reservations.
+- **Infrastructure:** tools and code for storage, networking, and messaging.
+- **Port:** an interface describing a way to use the application or a capability it needs.
+- **Adapter:** code connecting a port to a particular tool, such as a database.
+- **Hexagonal architecture:** organising code so business rules sit inside and tools connect through ports and adapters.
+- **Value object:** a value with its own checks, such as an amount and currency; it has no separate database identity.
+- **DDD:** Domain-Driven Design; organising code around business meanings and rules.
+- **CQRS:** separating how data is changed from how data is read.
+- **ADR:** a short written record of a design decision and its reasons.
+
+Start by identifying which code decides business rules and which code talks to tools. Then follow the refactor steps for one service.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Layered architecture, and where it leaks
 
@@ -25,8 +48,7 @@ domain         entities, business rules
 infrastructure repositories, Kafka, Feign, Redis
 ```
 
-**The problem is the last arrow.** `domain` sits above `infrastructure`, so the business rules end up
-depending on JPA, Jackson and Spring. Look at our `Event`:
+**Look at the dependency on storage tools.** Our business objects currently use JPA annotations, so their source code knows about the persistence framework. Here is `Event`:
 
 ```java
 @Entity                      // JPA
@@ -36,18 +58,17 @@ public class Event {
     private Long id;
 ```
 
-**The most important class in the system imports a persistence framework.** Consequences:
+**The business object depends on a database library.** This has some costs:
 
-- You cannot unit-test it without JPA on the classpath (it happens to work, but by luck).
-- Persistence concerns leak into design decisions (`@ManyToOne` versus an id, lazy versus eager).
-- Swapping Postgres for something else touches your domain classes.
+- Tests need JPA classes available even when they do not use a real database.
+- Database features can influence the business model, such as object relationships and lazy loading.
+- Changing the storage approach may require changes to business classes too.
 
-For a project this size that is an acceptable trade — and **saying "acceptable trade" rather than
-"correct" is the point**. Know what you gave up.
+For a small project, keeping JPA annotations in the model can be a reasonable simplification. Understand the cost rather than assuming one structure is always right.
 
 ## A2. Hexagonal architecture (ports and adapters)
 
-**Invert the dependency: the domain defines interfaces, and infrastructure implements them.**
+**Let the inside define what it needs.** Business code defines an interface for storage or another capability. Code on the outside implements that interface using the chosen tool.
 
 ```
         ┌──────────── driving adapters ────────────┐
@@ -71,64 +92,50 @@ For a project this size that is an acceptable trade — and **saying "acceptable
         └────────────── driven adapters ───────────┘
 ```
 
-**Every arrow points inward.** The domain knows nothing about HTTP, JPA or Kafka. It declares what it
-needs (`EventStore`) and something outside provides it.
+**The business code does not import HTTP, JPA, or Kafka classes.** It uses an interface such as `EventStore`. A separate implementation connects that interface to the real database.
 
-**Port** — an interface owned by the inside.
-**Adapter** — an implementation owned by the outside.
+**Port:** an interface for using the application or providing something it needs.
+**Adapter:** code that connects the interface to a specific tool or entry point.
 
 **What this actually buys you:**
 
-- The domain is testable with plain fakes and no framework.
-- A second driving adapter (Kafka consumer alongside REST) needs zero domain changes — **which we have
-  already done in Phase 12, informally**.
-- Infrastructure choices become replaceable in a way that is real rather than theoretical.
+- Business rules can be tested with a simple fake implementation, without starting a framework.
+- HTTP controllers and Kafka consumers can both call the same application logic. Phase 12 already used this idea.
+- A different storage or messaging implementation can be added behind the interface without changing the business rules.
 
-**What it costs:** more interfaces, more mapping between domain objects and JPA entities, more files.
-For a CRUD service it is overhead. **For a service with real rules — ours — it earns its keep.**
+**The cost is more code:** interfaces, separate database entities, and conversion between objects. A simple create/read/update/delete service may not need that extra structure. It becomes more useful when business rules are substantial.
 
-**We refactor one service to this structure**, so you have felt the difference and can argue either
-side.
+**Refactor one service in this phase.** Then compare it with the earlier structure and explain where each approach is useful.
 
 ## A3. DDD vocabulary for what you already built
 
-You have been doing DDD since Phase 4 without the labels. Here they are:
+**DDD means Domain-Driven Design.** It gives names to ways of keeping code close to business meanings. You have already used several of these ideas since Phase 4:
 
-**Entity** — identity that persists through change. `Event` with id 1 is the same event after a rename.
+**Entity:** an object identified by its id even when its details change. Event 1 is still the same event after a title change.
 
-**Value object** — no identity, defined entirely by its values, immutable. `Money(500, "USD")`. Two
-equal value objects are interchangeable. **We have none yet**, and `priceCents` as a bare `long` is the
-gap.
+**Value object:** an object defined by its values, without a separate identity. `Money(500, "USD")` can hold an amount, currency, and checks. Two Money objects with the same values mean the same thing. We have not added one yet; the price is still a plain `long`.
 
-**Aggregate** — a cluster changed as one unit. **Aggregate root** — the only entry point. `Event` is
-both.
+**Aggregate:** related data changed together. **Aggregate root:** the main object used to make those changes and check the rules. In our current model, `Event` fills both roles.
 
-**Invariant** — a rule that must always hold. `availableSeats >= 0`. Ours live inside the aggregate,
-which is why they cannot be broken.
+**Invariant:** a rule that must stay true, such as `availableSeats >= 0`. The Event object checks these rules when its methods change data.
 
-**Repository** — a collection-like interface for aggregates. One repository per aggregate root, never
-one per table.
+**Repository:** an interface used to load and save aggregates. Design it around the main business object, rather than adding one repository for every database table automatically.
 
-**Domain event** — something that happened, in the domain's language. `SeatsReserved`.
+**Domain event:** a fact about the business, such as `SeatsReserved`.
 
-**Bounded context** — Phase 4, concept A1. One per service here.
+**Bounded context:** an area with its own meaning of data and its own rules, as described in Phase 4. Each service is one such area in this project.
 
-**Ubiquitous language** — the same words in code, conversation and documentation. **`reserveSeats`, not
-`updateEventCount`.** When the business says "reserve" and the code says "update", every conversation
-needs a translation step, and translation is where bugs are born.
+**Ubiquitous language:** use the same business words in conversations, docs, and code. For example, `reserveSeats` says what the action means more clearly than `updateEventCount`.
 
 ### Aggregate design rules
 
-1. **Reference other aggregates by id, never by object.** `Booking` holds `eventId`, not an `Event`.
-   Phase 6 forced this because they are in different databases; it is good design even in one.
-2. **One transaction changes one aggregate.** Two aggregates atomically means either they are really one
-   aggregate, or you need a saga.
-3. **Keep aggregates small.** A large aggregate means more contention and more optimistic-lock
-   conflicts (Phase 8).
+1. **Refer to other aggregates by id.** `Booking` holds `eventId`, not an `Event` object. That also works across separate databases.
+2. **Keep each local transaction focused.** A workflow across services needs separate transactions and a recovery plan, such as a saga.
+3. **Keep aggregates small.** Large aggregates cause more requests to compete for the same updates and create more version conflicts.
 
 ## A4. Domain events versus integration events, one more time
 
-The distinction Phase 10a introduced, now applied concretely:
+The distinction Phase 10a introduced, now applied with an example:
 
 | | Domain event | Integration event |
 |---|---|---|
@@ -145,39 +152,28 @@ public record SeatsReservedEvent(Event event, int quantity, String bookingRef) {
 {"eventType":"SeatsReserved","version":1,"payload":{"eventId":1,"quantity":2,...}}
 ```
 
-**Publishing a domain event directly to Kafka is the same mistake as returning a JPA entity from a
-controller.** Everything you emit becomes something you can never change.
+Publishing an internal domain object makes its structure part of another service's expectations. Use a separate integration message format so internal refactoring does not unexpectedly break consumers.
 
-Spring's `ApplicationEventPublisher` with `@TransactionalEventListener(phase = AFTER_COMMIT)` is the
-clean way to raise domain events from an aggregate and translate them into outbox rows in one place —
-worth knowing, and a good refinement to Phase 11.
+`ApplicationEventPublisher` and `@TransactionalEventListener` can handle internal events around transaction boundaries. Pay attention to `phase = AFTER_COMMIT`: it runs after the original transaction commits. It does not by itself make a later outbox insert atomic with that earlier change. Phase 11's rule still applies: the outbox row and business change must commit together.
 
 ## A5. CQRS, in proportion
 
-**Command Query Responsibility Segregation:** separate the model you write with from the model you read
-with.
+**CQRS = Command Query Responsibility Segregation.** In simple words, separate the code and models used to change data from those used to read it.
 
-**Why:** writes need normalisation, invariants and transactions. Reads need denormalisation, joins and
-speed. One model serving both compromises on both.
+**Why separate them?** Writes must protect rules and save correct changes. Reads may need a convenient view combining or copying fields. The same object shape is not always best for both jobs.
 
 **Levels, from cheap to expensive:**
 
-1. **Separate methods** — `EventService.reserveSeats()` versus `EventQueryService.listPublished()`.
-   Nearly free. **Do this.**
-2. **Separate models** — commands use the aggregate; queries use projections or direct SQL, skipping
-   the entity entirely. Cheap and often worthwhile.
-3. **Separate databases** — a write store and a read store kept in sync by events. Powerful, and now
-   you own a synchronisation problem and eventual consistency in your reads.
-4. **Event sourcing** — store events as the source of truth and derive state. A different system with a
-   different set of problems.
+1. **Separate methods:** for example, `EventService.reserveSeats()` for a change and `EventQueryService.listPublished()` for a read. This is the simplest starting point.
+2. **Separate models:** writes use the business object; reads use DTOs or selected SQL fields without loading the whole object.
+3. **Separate databases:** changes go to one database, while messages update another database used for reads. This adds delayed agreement and recovery work.
+4. **Event sourcing:** store the history of changes as events and build current views from that history. This adds more design and operating work.
 
-**Levels 3 and 4 are where CQRS gets a bad reputation**, because people adopt them for CRUD
-applications. **We are at level 1, moving to level 2 for the list endpoint** — Phase 5's cached list
-already reads a DTO and never loads the aggregate, which is exactly the idea.
+**Do not jump straight to separate databases or event sourcing.** This project starts with separate read and write methods and moves towards separate read models. A cached list response is already an example of a read-focused view.
 
 ## A6. Architecture Decision Records
 
-An **ADR** is a short document recording one decision and *why*.
+**ADR = Architecture Decision Record.** It is a short note explaining what you chose, why you chose it, and what alternatives you considered.
 
 ```markdown
 # ADR 004: Transactional outbox for event publishing
@@ -206,12 +202,9 @@ A polling publisher reads unpublished rows and sends them to Kafka.
 - CDC (Debezium): rejected for now — extra infrastructure; revisit if polling load grows.
 ```
 
-**Write ADRs for decisions that were hard, contested, or will look strange to a newcomer.** Not for
-"we used Spring Boot".
+**Write ADRs for choices a new reader might question.** For example, explain why an outbox is needed rather than only writing "we use Spring Boot."
 
-**Why it matters:** in a year, someone (probably you) will see the outbox table and ask "why not just
-publish?" Without the ADR they will guess, and they may "simplify" it away. **An ADR is how a decision
-survives the person who made it** — and being the person who writes them is a genuine seniority signal.
+Later, someone may see the outbox table and ask why messages are not sent directly. An ADR preserves the failure case and reasoning, so a cleanup does not accidentally remove an important protection.
 
 ---
 
@@ -248,8 +241,7 @@ com.eventbooking.event
         └── cache/       RedisEventCache.java
 ```
 
-**The rule you can check mechanically: nothing in `domain` may import `org.springframework`,
-`jakarta.persistence`, or `com.fasterxml`.** That one grep is the whole discipline.
+**Check the dependency rule:** files in `domain` must not import `org.springframework`, `jakarta.persistence`, or `com.fasterxml`. This keeps the business code separate from these tools.
 
 ## Step 2 — Value objects
 
@@ -301,7 +293,7 @@ The **compact constructor** (`public Money {`) validates before the fields are a
 `Money` cannot exist. That is the same guarantee as our aggregate constructors, at the level of a single
 value.
 
-`multiply` returns a **new** `Money` — value objects are immutable, so they can be shared freely with no
+`multiply` returns a **new** `Money` — value objects are fixed after creation, so they can be shared freely with no
 defensive copying and no thread-safety concerns.
 
 **File:** `.../domain/model/SeatCount.java`
@@ -338,9 +330,7 @@ public record SeatCount(int value) {
 }
 ```
 
-**`SeatCount` cannot be negative — enforced by the type itself.** Phase 8's oversell drill produced
-`available_seats = -7`; with this type, the *code path* that produced it throws at the point of the
-mistake rather than persisting a nonsense value.
+**`SeatCount` rejects negative values when created.** Instead of carrying an invalid value further into the application, the code fails at the place that tried to create it. Database constraints still protect writes made outside this object.
 
 `plusCappedAt` carries the idempotent-release rule from Phase 4 into the type. **The rule now lives with
 the data it constrains**, so nobody has to remember it.
@@ -387,9 +377,7 @@ public interface ReserveSeatsUseCase {
 }
 ```
 
-**An inbound port is the application's public API, independent of transport.** The REST controller and
-the Kafka consumer both call this same method — **which is what we already did in Phase 12, informally.
-Now the shape makes it obvious.**
+**An inbound port is an interface callers use to run application actions.** Both an HTTP controller and a Kafka consumer can call it. The interface does not need to know which transport brought the request.
 
 The command is a `record` nested in the interface: it belongs to this use case and nowhere else.
 
@@ -459,14 +447,9 @@ public class Event {
 }
 ```
 
-**No annotations. No imports outside `java.*` and your own package.** This class can be unit-tested by a
-developer who has never heard of Spring, and it will still compile in ten years when the persistence
-framework has changed.
+**This class uses only `java.*` and our own code.** It has no Spring or JPA annotations, so its business rules can be tested without those frameworks. Database and HTTP code live outside it.
 
-**Two constructors with different jobs:** the public one **reconstitutes** an existing event from
-storage (id and version already known); the static `create` factory **makes a new one** and enforces the
-creation rules. Reconstitution must not re-run creation validation — an event created last year with
-today's rules would fail to load, which is a genuinely painful production bug.
+**There are two ways to build the object.** The public constructor restores an event already saved in the database, including its id and version. The static `create` method makes a new event and checks creation rules. Loading an old event must not reject it just because a rule for new events changed later.
 
 **`reserveSeats` reads almost like English** now that the types carry the concepts:
 `if (!availableSeats.isAtLeast(quantity))`. That is the ubiquitous language showing up in the code.
@@ -552,10 +535,7 @@ architecture, and it is real.**
 **What you get for it:** the JPA entity can change — column names, lazy loading, inheritance strategy —
 without touching a line of domain code. The domain can be tested with a `Map`-backed fake `EventStore`.
 
-**What it costs:** two classes to keep in sync, mapping code to write, and a real gotcha in `toEntity`:
-loading the existing entity so `@Version` is preserved. **Forget that and every save overwrites the
-version, and Phase 8's optimistic locking silently stops working.** A test would catch it (Phase 13);
-without one it is invisible until you have concurrent users.
+**The extra work is keeping two representations and mapping between them.** In `toEntity`, preserve the existing entity's `@Version`. Losing or resetting that value can break the competing-update protection from Phase 8. Add a test for the mapping and version behaviour.
 
 **Be honest about the trade in an interview.** "We used ports and adapters in the service with real
 domain logic and plain layering in the CRUD ones" is a better answer than either purist position.
@@ -596,9 +576,7 @@ persistence is Postgres or a `HashMap`, or whether publishing means Kafka or a l
 the transaction boundary. The domain must not know transactions exist; the adapters must not decide
 them.
 
-**The explicit `eventStore.save(event)`** replaces JPA's dirty checking. In a hexagonal design that is
-correct — the domain object is not a managed entity, so the use case must say what it wants persisted.
-**More typing, and much more obvious**: Phase 4's Drill 5 silent no-op cannot happen here.
+**Call `eventStore.save(event)` to save changes.** This domain object is not a JPA-managed entity, so Hibernate is not tracking its field changes. The application must request the save rather than rely on dirty checking.
 
 ## Step 7 — Write the ADRs
 
@@ -638,7 +616,7 @@ Walk the system once more and check each item honestly.
 
 **Data correctness**
 - [ ] Invariants live in aggregates
-- [ ] Concurrent writes cannot oversell
+- [ ] Happening at the same time writes cannot oversell
 - [ ] Duplicate requests cannot double-book
 - [ ] Duplicate messages cannot double-apply
 - [ ] Events are never lost between the database and Kafka
@@ -655,7 +633,7 @@ Walk the system once more and check each item honestly.
 - [ ] Health checks reflect real dependencies
 - [ ] Backlog, lag and breaker state are observable
 - [ ] Secrets come from the environment, never from Git
-- [ ] Migrations are versioned and immutable once applied
+- [ ] Migrations are versioned and fixed after creation once applied
 
 ## Step 9 — Be able to answer these
 
@@ -706,25 +684,24 @@ system.
 | Domain importing Spring or JPA | Not actually hexagonal | Grep the domain package |
 | Anaemic domain model | Fat services, rules duplicated | Behaviour on the aggregate |
 | Primitives for money and counts | Silent unit and currency bugs | Value objects |
-| Publishing domain events directly | Internals become a public contract | Map to integration events |
+| Publishing domain events directly | Internal details become a public contract | Map to integration events |
 | CQRS with separate databases too early | Sync problems you did not need | Start at level 1 |
 | Aggregate holding another aggregate | Huge transactions, more conflicts | Reference by id |
 | Re-running creation rules on load | Old data cannot be loaded | Separate factory from reconstitution |
-| Losing `@Version` in the mapper | Optimistic locking silently disabled | Load, then update |
+| Losing `@Version` in the mapper | Optimistic locking without a clear error disabled | Load, then update |
 | No ADRs | Decisions get "simplified" away | One page each |
 | Code and business using different words | Every discussion needs translation | Ubiquitous language |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Consistency of structure matters more than purity.** Pick a shape per service type and stick to it.
-- **Enforce the domain's independence** with ArchUnit — a test that fails if `domain` imports Spring.
-- **ADRs live in the repository**, versioned with the code they describe.
-- **Revisit boundaries yearly.** If two services always change together, they may be one service.
-- **Value objects for every domain concept with rules** — money, quantities, identifiers, email
-  addresses.
-- **Keep the ubiquitous language honest.** When the business renames something, rename it in the code.
+- **Use a consistent structure** so readers can find the same kinds of code in each service.
+- **Check dependency rules with ArchUnit**, for example rejecting a Spring import inside `domain`.
+- **Keep ADRs in the repository** beside the code they explain.
+- **Review service boundaries over time.** Services that always change together may need a different boundary.
+- **Use value objects where values have rules**, such as money, quantities, identifiers, and email addresses.
+- **Keep business names consistent.** If the business changes a term, review the names used in code too.
 
 ---
 
@@ -746,11 +723,7 @@ system.
 
 Look back at what the system does.
 
-A user request enters one gateway, is authenticated once at the edge, is routed by a logical service
-name resolved through a registry, reaches a service that trusts a header because of a deliberate
-network boundary, creates a booking in its own database together with an outbox row in one transaction,
-returns `202 Accepted` in 50 milliseconds, and then — asynchronously, durably, idempotently, in order —
-reserves seats in a different service with a different database, replies, and confirms the booking.
+A client sends a request to the gateway. The gateway checks the token and finds the target service through Eureka. That service trusts the forwarded user headers only under the network protection described earlier. Booking-service saves a pending booking and an outbox message in one transaction, then returns `202 Accepted`. Later, messages ask event-service to handle the seats. Its reply lets booking-service confirm or reject the booking. Saved outgoing messages and duplicate checks help this continue safely after failures.
 
 **If any part of that fails**, the system does not lose data: the outbox retries, the consumer
 deduplicates, the breaker sheds load, the lock prevents overselling, the saga times out and compensates,
@@ -760,14 +733,11 @@ and the correlation id lets you follow every step.
 
 ### Where to go next
 
-- **Observability** — Micrometer, Prometheus, Grafana, OpenTelemetry tracing. You built correlation ids
-  by hand; now see the real thing.
-- **Deployment** — Docker images, Kubernetes, health probes, rolling deploys. Everything you skipped on
-  purpose.
-- **Payments** — add a payment service and watch the saga grow to four steps, then convert it to
-  orchestration and feel the difference.
-- **Scale** — load test, find the hot partition, shard the seat counter, measure.
-- **Event sourcing** — the next step past level 2 CQRS, if the domain justifies it.
+- **Observability:** tools for understanding the running system through logs, measurements, and traces. Explore Micrometer, Prometheus, Grafana, and OpenTelemetry after the correlation-id work.
+- **Deployment:** packaging and running services using Docker images, Kubernetes, health checks, and gradual updates.
+- **Payments:** add another service and consider whether a central saga coordinator makes the longer flow easier to manage.
+- **Scale:** measure under load, find the busiest partition or seat counter, and address the measured limit.
+- **Event sourcing:** consider storing a history of changes if the business needs justify its added complexity.
 
 ### And when you are asked about this project
 

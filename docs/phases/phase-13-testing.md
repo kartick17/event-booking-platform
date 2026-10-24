@@ -4,12 +4,34 @@
 **Needs:** Phase 12 finished.
 **Pre-reading:** the test pyramid; why Testcontainers beats an in-memory H2 database.
 
-Every failure drill you ran by hand disappears the moment someone changes a line. This phase turns them
-into tests that run on every build.
+Manual checks are useful, but they do not run again by themselves after code changes. This phase turns important failure exercises into repeatable tests run by the build.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase turns the checks you ran by hand into tests the computer can run again. Tests should catch problems when someone changes the code later.
+
+Example: a test starts with 1 seat, sends several booking attempts, and checks that only the allowed number succeeds. Another test delivers the same message twice and checks that the seat change happens once.
+
+Words used in this phase:
+
+- **Assertion:** a check that compares the actual result with the expected result.
+- **Unit test:** checks a small part, often one object, without starting the whole application.
+- **Integration test:** checks real parts working together, such as Java code and Postgres.
+- **End-to-end test:** checks a complete flow across its main components.
+- **Test double:** a replacement for a dependency during a test. A fake has a small working implementation; a stub supplies set answers; a mock can check calls.
+- **Testcontainers:** a tool that starts real databases or brokers in Docker for tests.
+- **Awaitility:** a tool that waits for an expected result, up to a chosen time limit.
+- **Contract test:** checks that the data one service provides still matches what another service needs.
+- **Regression test:** a test that prevents a fixed bug from returning.
+- **CI:** automated checks run when code is pushed or reviewed.
+
+Start with tests of the Event object's rules. Use broader tests when the behaviour depends on databases, messages, or several services working together.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. The pyramid, and what each level is for
 
@@ -27,31 +49,25 @@ into tests that run on every build.
 | Integration (`@SpringBootTest` + Testcontainers) | full | yes | 5–30 s | does it work with real infrastructure? |
 | E2E (all services running) | full | yes | minutes | does the whole system work? |
 
-**Push tests down the pyramid.** A rule that can be tested with a plain unit test should not need
-Postgres. **Our Phase 4 aggregate design pays off here:** `Event.reserveSeats()` is testable with `new
-Event(...)` and no framework at all.
+**Use the smallest test that proves the behaviour.** A seat rule can be checked with `Event.reserveSeats()` on an object made using `new Event(...)`. It does not need a running database or Spring application. The object design from Phase 4 makes this possible.
 
-**The inverted pyramid** — mostly slow integration tests — is the most common testing failure. Builds
-take twenty minutes, so developers stop running them, so bugs reach main.
+If nearly every test starts the whole system, the build becomes slow and harder to diagnose. Keep many quick tests for individual rules and a smaller number of broader tests for parts working together.
 
 ## A2. Why H2 lies to you
 
-The tempting shortcut: an in-memory H2 database for tests. It is fast, and it is wrong.
+H2 is a convenient in-memory database, but it does not behave exactly like Postgres. A passing H2 test cannot prove that Postgres-specific queries and locks work.
 
 **What H2 cannot tell you about Postgres:**
 
-- `FOR UPDATE SKIP LOCKED` — Phase 11 depends on it. H2's support differs.
-- Partial indexes (`WHERE published_at IS NULL`) — Phase 11's key performance decision.
-- `TIMESTAMPTZ` semantics, `JSONB`, arrays, `ON CONFLICT`.
-- Real MVCC behaviour and lock timing — **Phase 8's entire subject**.
-- Sequence and identity behaviour, actual constraint error messages.
+- **Locking queries:** Phase 11 uses `FOR UPDATE SKIP LOCKED`; another database may behave differently.
+- **Partial indexes:** an index using `WHERE published_at IS NULL` is important to outbox performance.
+- **Postgres types and SQL:** examples include `TIMESTAMPTZ`, `JSONB`, arrays, and `ON CONFLICT`.
+- **Overlapping transactions:** Postgres row versions and lock timing matter to Phase 8.
+- **Generated ids and errors:** sequences, identity values, and constraint failures can differ between databases.
 
-**Testing against a database you do not deploy tests the wrong thing.** The bugs that reach production
-are precisely the ones in the gap between H2 and Postgres.
+**Test database-specific behaviour on the database you use.** Differences in SQL, locking, indexes, and types can make a test pass on H2 while the real application fails on Postgres.
 
-**Testcontainers** runs real Postgres, Redis and Kafka in Docker for the test's lifetime. Slower to
-start, and it tests what you actually ship. **For a project whose hard parts are locking, partial
-indexes and Kafka semantics, there is no alternative.**
+**Testcontainers starts real tools in Docker for the test.** It takes longer than a plain unit test, but lets us verify the actual Postgres, Redis, and Kafka behaviour this project depends on.
 
 ## A3. Test doubles, and what not to mock
 
@@ -63,20 +79,15 @@ indexes and Kafka semantics, there is no alternative.**
 | **Mock** | pre-programmed with expectations, verified |
 | **Fake** | a working lightweight implementation (an in-memory repository) |
 
-**The rule: do not mock what you do not own.**
+**Replace your own boundaries in small tests; check external behaviour with real tools where needed.**
 
-Mocking `KafkaTemplate` or a JDBC driver encodes *your belief* about how it behaves. When your belief is
-wrong, the test passes and production fails. Mock **your own interfaces** (`EventGateway`,
-`OutboxWriter`); use real instances or Testcontainers for third-party libraries.
+A mock of `KafkaTemplate` or JDBC behaves as you tell it to. It cannot prove that real Kafka or Postgres works that way. Mock your own interfaces, such as `EventGateway` and `OutboxWriter`, for unit tests, and use integration tests to check the real libraries and tools.
 
-**Corollary: mocks test interactions, not behaviour.** `verify(repo).save(any())` proves a method was
-called, not that anything correct happened. Over-mocked tests pass while the system is broken, and they
-break on every harmless refactor.
+**Checking a method call is not the same as checking a result.** `verify(repo).save(any())` only proves a save was requested. Also check the important business outcome. Tests tied to every internal call can break after harmless code changes without finding real bugs.
 
 ## A4. Testing asynchronous code
 
-Phase 12's saga takes 300–600 ms and spans two services. `Thread.sleep(1000)` in a test is the classic
-mistake: too short and it is flaky, too long and your suite crawls.
+The saga finishes later, after messages cross services. A fixed `Thread.sleep(1000)` makes tests wait even when work is already done, and can still fail on a slower machine. Wait for the actual expected condition with a time limit.
 
 **Use Awaitility** — poll until a condition holds, with a timeout:
 
@@ -86,20 +97,15 @@ await().atMost(Duration.ofSeconds(10))
        .untilAsserted(() -> assertThat(repo.findByRef(ref).getStatus()).isEqualTo(CONFIRMED));
 ```
 
-Returns as soon as it is true, fails fast if it never is. **Fast when it works, clear when it does
-not.**
+Awaitility checks the condition repeatedly and returns when it becomes true. If it never becomes true within the time limit, the test fails.
 
-**Flaky tests are worse than no tests.** A suite that fails randomly gets ignored, and then a real
-failure gets ignored too. Root causes: fixed sleeps, shared state between tests, dependence on test
-order, real clocks.
+**Avoid tests that pass or fail depending on timing.** Fixed sleeps, shared test data, dependence on test order, and real-time clock assumptions are common causes. Make failures repeatable so people can trust the test results.
 
 ## A5. Contract testing
 
-Phase 6's warning: booking-service copies `EventDto` and does not share a class with event-service. Good
-for decoupling, but **nothing stops event-service renaming a field and breaking booking-service** with
-both builds green.
+Booking-service owns its own `EventDto`, which keeps its code separate from event-service. But event-service could still rename a JSON field and break that consumer. Separate successful builds do not prove the two services agree on the response format.
 
-**Contract testing** fixes that without recoupling:
+**A contract test records what the consumer needs and checks that the provider still supplies it:**
 
 ```
 consumer (booking-service) writes:  "given event 1 exists, GET /events/1 returns id, title, priceCents"
@@ -108,15 +114,12 @@ provider (event-service) build:      replays the contract against the real contr
    → provider build FAILS if it no longer satisfies it
 ```
 
-**The consumer states its needs; the provider's build verifies them.** Renaming `priceCents` now breaks
-event-service's build, at the right time, in the right repository.
+**The consumer describes the expected fields; the provider tests its response against them.** Removing `priceCents` then fails event-service's build before the incompatible change is released.
 
 Tools: **Spring Cloud Contract** (Groovy/YAML contracts, JVM-focused) and **Pact** (cross-language, a
 broker for sharing contracts).
 
-**Understand the concept even if you never write one** — "how do you stop one service breaking another?"
-is a standard interview question, and "contract tests" is the answer that shows you have thought about
-it.
+The main idea is simple: test the agreement between services, not just each service on its own. This helps catch changes that would break another service.
 
 ---
 
@@ -265,9 +268,7 @@ class EventTest {
 
 **No Spring. No database. No mocks. Runs in single-digit milliseconds.**
 
-**These tests are only possible because the rules live in the aggregate** (Phase 4). If `reserveSeats`
-were logic inside a service that called a repository, every one of these would need mocks or a database.
-**Testability is the practical measure of good domain design**, and this file is the evidence.
+**These rules can be tested on a plain Event object.** Because `reserveSeats` lives there, the test does not need a controller, repository, or database. This shows the practical benefit of keeping business rules together.
 
 **`never_exceeds_capacity_on_duplicate_release` is the most valuable test here.** It encodes the
 idempotency decision from Phase 4 that Phase 12 depends on. Someone "simplifying" `Math.min` away later
@@ -412,10 +413,7 @@ no database, no Kafka. Starts in about a second.
 configuration and **your security tests test the wrong rules**. They would still pass, and they would be
 meaningless.
 
-**Three of these five tests are security tests**, and they encode Phase 4's authorization exactly:
-public read, authenticated write, ADMIN-only create. **Authorization rules are the easiest thing to
-break accidentally and the most expensive to get wrong** — they deserve tests more than most business
-logic.
+**Three tests check access rules:** public reads, authenticated writes, and admin-only creation. They preserve the intended permissions from Phase 4 and catch changes that accidentally make an endpoint public or block allowed users.
 
 `rejects_invalid_payload_with_field_errors` locks in the `ApiError` contract from Phase 2a. Clients
 depend on that JSON shape.
@@ -486,9 +484,7 @@ quietly swaps in H2 and **you are back to testing the wrong database** (concept 
 **`static` container** — one Postgres for the whole test class, not one per test. Container startup is
 the expensive part.
 
-**These three tests cover Phase 11's real mechanics:** the unpublished filter, the backoff schedule, and
-the unique constraint that makes dedup work. **All three depend on Postgres behaviour** and none would
-be meaningfully tested against H2.
+**These tests need real Postgres behaviour.** They check the unpublished-row filter, retry timing, and the unique constraint used for duplicate protection. H2 is not enough to verify the Postgres-specific parts.
 
 ## Step 6 — Full integration: the saga end to end
 
@@ -580,10 +576,7 @@ class SagaIntegrationTest {
 **Real Postgres, real Kafka, real Redis.** The dedup insert, the transaction boundary, the partition key,
 the aggregate rules — all exercised as they run in production.
 
-**`await().during(...)` in the duplicate test is the subtle one.** Asserting once proves nothing about a
-duplicate that has not arrived yet; holding the assertion for three seconds proves the second message
-was genuinely ignored rather than merely slow. **Testing that something does *not* happen requires
-time**, and this is how you do it without a `sleep`.
+**`await().during(...)` keeps checking for a period of time.** One quick check could pass before the duplicate message is handled. Requiring the seat count to stay unchanged for three seconds gives the duplicate a chance to arrive. It tests that period; it does not prove the value can never change later.
 
 **Container startup is 10–20 seconds**, so keep these tests few and meaningful. Everything cheaper
 belongs at a lower level (concept A1).
@@ -628,9 +621,7 @@ belongs at a lower level (concept A1).
     }
 ```
 
-**`CountDownLatch` as a start gate is the technique to remember.** Threads submitted in a loop start at
-slightly different times, which hides races. The latch holds all 100 until they are ready, then releases
-them together — maximum contention, reproducible.
+**`CountDownLatch` releases the test workers together.** Starting them one by one can hide timing conflicts. The latch waits until they are ready, then lets all 100 begin, making overlapping updates easier to reproduce.
 
 **This is Phase 8's oversell drill as a permanent test.** Assert exactly 50 and 50, never "at most 50" —
 a weaker assertion would pass if the code accidentally rejected everything.
@@ -694,13 +685,9 @@ logging:
 instead of the deployment — and this is the *only* place your migrations get exercised before
 production.
 
-**`group-id: test-${random.uuid}`** gives each run a fresh consumer group, so it reads from the
-beginning and does not inherit offsets from a previous run. Shared group ids across test runs cause the
-most baffling flakiness in Kafka testing.
+**`group-id: test-${random.uuid}` gives each test run its own consumer group.** Combined with the test's offset-reset settings, it avoids reusing a previous run's saved reading position. Shared test group ids can make tests miss messages unpredictably.
 
-**Speed:** reuse containers across classes by declaring them `static` in an abstract base class that
-tests extend. Testcontainers reuse (`testcontainers.reuse.enable=true` in `~/.testcontainers.properties`)
-keeps them alive between runs locally — a large win, and one to disable in CI.
+**Reduce startup time by sharing test containers where appropriate.** A `static` container on a common base class can be reused by several test classes. Local reuse through `testcontainers.reuse.enable=true` in `~/.testcontainers.properties` can also keep containers between runs. Disable that local reuse option in CI and keep test data isolated.
 
 ---
 
@@ -730,7 +717,7 @@ converts "we have tests" into "we have tests that matter."
 | Mistake | Symptom | Fix |
 |---|---|---|
 | H2 instead of Postgres | Passes locally, fails in production | Testcontainers |
-| `@DataJpaTest` without `replace = NONE` | H2 silently substituted | Add the annotation |
+| `@DataJpaTest` without `replace = NONE` | H2 without a clear error substituted | Add the annotation |
 | `@WebMvcTest` without importing security config | Security tests are meaningless | `@Import` your config |
 | `Thread.sleep` in async tests | Flaky and slow | Awaitility |
 | Asserting once for a duplicate test | Proves nothing | `await().during(...)` |
@@ -744,20 +731,16 @@ converts "we have tests" into "we have tests that matter."
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Run integration tests in CI on every PR.** Testcontainers needs Docker on the runner.
-- **Keep unit tests under 10 seconds total** so people run them constantly.
-- **Coverage is a smell detector, not a goal.** 100% coverage of getters says nothing. Untested
-  compensation logic says a lot.
-- **Test data builders** (`anEvent().withCapacity(5).published().build()`) keep tests readable as they
-  multiply.
-- **Contract tests** (concept A5) between event-service and booking-service, so a renamed field breaks
-  the right build.
-- **Chaos testing with Toxiproxy** — add latency or drop connections inside integration tests to verify
-  Phase 7's circuit breakers actually behave as configured.
-- **Load-test the booking path** before launch. Phase 8's bugs are invisible at low concurrency.
-- **A regression test for every production bug**, always, before the fix.
+- **Run integration tests in CI for each pull request.** The test machine needs Docker for Testcontainers.
+- **Keep unit tests quick**, aiming for under 10 seconds total, so they are easy to run often.
+- **Coverage shows what ran, not whether the checks were useful.** Focus on important rules and failure paths rather than a percentage alone.
+- **Use test-data builders** such as `anEvent().withCapacity(5).published().build()` to make setups clear.
+- **Add contract tests** between event-service and booking-service to catch incompatible field changes.
+- **Test slow and broken connections.** Toxiproxy can introduce delays or dropped connections to check the Phase 7 behaviour.
+- **Test under load.** Conflicting bookings may only appear with overlapping requests.
+- **Add a regression test for a discovered bug** so a later change cannot quietly bring it back.
 
 ---
 
@@ -782,9 +765,7 @@ converts "we have tests" into "we have tests that matter."
 
 The system works and is tested. Now step back from it.
 
-**Architecture polish:** layered versus hexagonal, ports and adapters applied to one service, DDD
-vocabulary (aggregate, value object, domain event) applied to what you already built, CQRS basics, and
-architecture decision records so the reasoning survives you.
+**Next, make the code structure easier to explain.** Phase 14 compares layers with ports and adapters, applies the design terms to your existing classes, separates read and write models where useful, and records the reasons for major choices.
 
 Plus the final review — the questions you should now be able to answer about any multi-service Spring
 application.

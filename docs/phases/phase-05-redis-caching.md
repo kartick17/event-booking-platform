@@ -6,15 +6,35 @@
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase makes repeated event reads faster by keeping temporary copies in Redis. PostgreSQL remains the place where the real data is saved.
+
+For example, many people may open the same concert page. After the first database read, later requests can reuse a Redis copy. When the event changes, remove the old copy. Seat reservation must still check the real database count, because a cached count may be old.
+
+Words used in this phase:
+
+- **Cache:** a temporary copy kept so repeated reads take less work.
+- **Key:** the name used to find a cached value, such as an event id.
+- **Cache hit / miss:** the copy was found / the copy was not found.
+- **TTL (time to live):** how long a cached copy may stay before it expires.
+- **Invalidation:** removing an old copy after the real data changes.
+- **Eviction:** removing a cache entry. Redis also uses this word for removing entries when memory is full.
+- **Stale data:** a cached copy that no longer matches the latest saved data.
+- **Serialization:** turning a Java object into data that can be stored, such as JSON. Deserialization turns it back.
+- **AOP proxy:** a wrapper Spring puts around an object to add work such as caching or transaction handling.
+
+Start with the cache hit/miss flow in A2. Then ask, "When does this copy become too old, and what removes it?"
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Why cache at all
 
-`GET /api/v1/events/1` currently does: HTTP → Tomcat thread → Hibernate → JDBC → Postgres → parse rows
-→ build objects → JSON. Roughly **5–20 ms**, most of it waiting on the database.
+`GET /api/v1/events/1` currently reaches the controller, loads the row from Postgres through Hibernate and JDBC, builds the response object, and converts it to JSON. A database read may take roughly **5–20 ms** in this example.
 
-The same request from Redis: **0.2–1 ms**. Not because Redis is magic, but because it is an in-memory
-hash map reached over one TCP round trip, with no query planner, no disk, and no object mapping.
+Reading the same data from Redis can be quicker, roughly **0.2–1 ms** in this example. Redis keeps data in memory and can return it without running the database query again. Actual times depend on your setup.
 
 Rough numbers worth carrying in your head:
 
@@ -27,17 +47,14 @@ Rough numbers worth carrying in your head:
 | Postgres complex join | ~10–100 ms |
 | Disk seek (spinning) | ~10 ms |
 
-**But speed is the smaller half of the argument.** The bigger one is **load**. 1000 requests/second for
-the same popular event is 1000 database queries per second for a row that has not changed all day. Your
-database has finite connections (Phase 4: pool of 10). Caching turns that into ~1 query per TTL window,
-and the database gets to spend its connections on writes.
+**Caching also reduces database work.** If 1000 people request the same unchanged event each second, the database repeats the same query. A cached copy lets many of those requests reuse one result, leaving database connections available for writes.
 
 ### When caching is right, and when it is a trap
 
 **Good candidates:** read far more often than written; the same values requested repeatedly; slightly
-stale data is acceptable; expensive to compute.
+out of date data is acceptable; expensive to compute.
 
-**Bad candidates:** written as often as read; every request wants different data (no reuse); **stale
+**Bad candidates:** written as often as read; every request wants different data (no reuse); **out of date
 data is dangerous**.
 
 **Our decisions in this service:**
@@ -46,15 +63,11 @@ data is dangerous**.
 |---|---|---|
 | Event details (title, venue, date) | **yes** | Read constantly, changed rarely |
 | Published events list (page 1) | **yes, short TTL** | Hot, mostly stable |
-| `availableSeats` | **no — read from the database** | Changes on every booking; stale here means double booking |
+| `availableSeats` | **no — read from the database** | Changes on every booking; out of date here means double booking |
 
-**That third row is the important one.** It is tempting to cache the whole `Event` including seat count.
-Do not. A cached seat count is a *lie about inventory*, and Phase 8 is entirely about not lying about
-inventory. We will cache the event and treat `availableSeats` in the cached copy as **display-only**;
-the booking path always reads the live row.
+**Cached seat counts are only for display.** A count may change after the copy is cached. The reservation path must check the live database row before accepting seats. A screen showing 2 available seats is not a promise that both are still available.
 
-Being able to say "we deliberately did not cache X" is a stronger interview signal than caching
-everything.
+Know why you choose to cache some data and leave other data uncached. Faster reads are useful only when an older answer is acceptable.
 
 ## A2. Caching patterns
 
@@ -75,20 +88,15 @@ write:
   cache.delete(key)                         ← invalidate, do not update
 ```
 
-**Why it wins:** only requested data is cached (no wasted memory), and if the cache dies everything
-still works — slower, but correct. Failure of the cache is not failure of the system.
+**Benefits:** the cache contains data people actually requested. If Redis fails, the application can read from the database instead, provided we add the error handling shown later.
 
-**Its weaknesses**, both real: the first request after a miss is slow, and there is a window where the
-database has new data and the cache still holds the old.
+**Limits:** a cache miss still needs the slower database read. Also, a cached copy may briefly remain old after the database changes.
 
 ### The others, briefly
 
-- **Read-through** — the cache itself loads from the database on a miss. Cleaner application code, but
-  the cache becomes infrastructure that must know your schema.
-- **Write-through** — write to the cache and the database together, synchronously. Cache is never
-  stale; every write is slower.
-- **Write-behind (write-back)** — write to the cache, flush to the database later. Very fast writes;
-  **you lose data if the cache dies before the flush.** Only for data you can afford to lose.
+- **Read-through:** the cache system loads missing data from the database. This moves loading code out of the application, but the cache system must understand the data source.
+- **Write-through:** the write path updates the cache and database before returning. This adds waiting and still needs clear failure handling for both writes.
+- **Write-behind / write-back:** save to the cache first and write to the database later. It can be fast, but a cache failure before the database save can lose data.
 
 **Cache-aside is the default for a reason.** Spring's `@Cacheable` implements exactly this pattern.
 
@@ -101,7 +109,7 @@ cache.put(key, newValue);   // update
 cache.evict(key);           // delete
 ```
 
-**Delete is safer, and this is a genuinely subtle point.** With two concurrent writers:
+**Deleting the old entry is usually easier to manage than updating two copies.** With two requests changing the same record at once:
 
 ```
 Writer A: DB write v1 ──────────▶ cache.put(v1)
@@ -110,40 +118,33 @@ Writer B:      DB write v2 ─▶ cache.put(v2)
    final DB state = v2, final cache state = v1.  Permanently wrong.
 ```
 
-Interleaving is possible because the database write and the cache write are two separate operations
-with no shared lock. With `evict`, the worst outcome is an extra cache miss — the next reader reloads
-whatever the database actually holds. **Wrong-but-fast recovers; wrong-and-cached does not.**
+Database and cache changes are separate operations, so they can finish in different orders. Deleting the cached entry lets a later read reload the database value. There can still be timing gaps, especially around transaction commit; Step 6 explains them.
 
 ## A3. TTL and eviction
 
-**TTL (time to live)** — how long a key survives. It is your safety net: even if every invalidation you
-wrote is buggy, the cache self-corrects within the TTL.
+**TTL (time to live)** is the time before a cache entry expires. If an old entry was not removed correctly, expiry eventually forces a fresh load. A shorter TTL limits how long old data may be shown.
 
-Picking one is a business question, not a technical one: *how stale may this be?*
+Picking one is a business question, not a technical one: *how out of date may this be?*
 
 | Data | TTL | Reasoning |
 |---|---|---|
-| Event details | 10 min | Changes rarely; 10 minutes of staleness is harmless |
+| Event details | 10 min | Changes rarely; 10 minutes of how out of date the data can be is harmless |
 | Event list | 60 s | New events should appear quickly |
-| Seat counts | **not cached** | Any staleness is a correctness bug |
+| Seat counts | **not cached** | Any how out of date the data can be is a correctness bug |
 
-**Eviction** is different from expiry: it is what Redis does when it hits `maxmemory`. Policies include
-`allkeys-lru` (evict least recently used — the usual choice for a pure cache), `volatile-ttl` (evict
-the soonest to expire), and `noeviction` (reject writes — correct for a queue, fatal for a cache).
+Redis also removes entries when it reaches `maxmemory`. Its **eviction policy** decides which entries to remove. `allkeys-lru` removes entries not used recently; `volatile-ttl` favours entries nearest expiry; `noeviction` refuses new writes instead of removing entries.
 
-**Set `maxmemory` and a policy.** With the default `noeviction`, a full Redis starts refusing writes,
-and your "optional" cache becomes an outage.
+**Choose a memory limit and eviction policy.** If Redis becomes full and refuses cache writes, those failures must not unexpectedly break ordinary requests.
 
 ## A4. The four ways caches go wrong
 
 ### 1. Stale data
 
-Someone updates the database and the cache still serves the old value until eviction or TTL. **This is
-inherent, not a bug.** You manage it with short TTLs and eviction on write; you do not eliminate it.
+The database changes, but a cached copy still shows the old value. This is **stale data**. Short TTLs and removing entries on writes reduce how long it lasts, but separate database and cache operations can still leave timing gaps.
 
 ### 2. Cache stampede (thundering herd)
 
-A popular key expires. In that instant 500 concurrent requests all miss, and all 500 hit the database
+A popular key expires. In that instant 500 happening at the same time requests all miss, and all 500 hit the database
 for the same row.
 
 ```
@@ -152,14 +153,12 @@ for the same row.
  500 req ─┼──▶ all miss ──▶ 500 identical queries ──▶ database melts
 ```
 
-Fixes: a short lock so only one request recomputes (Phase 8's distributed lock), recomputing *before*
-expiry, or **adding random jitter to TTLs** so a thousand keys written together do not all expire
-together. Jitter is the cheapest and helps most.
+Ways to reduce the problem: let only one request reload a value, refresh it before expiry, or add a small random amount to expiry times. This random variation is called **jitter**. It helps entries written together expire at different times.
 
 ### 3. Cache penetration
 
 Requests for a key that **does not exist anywhere**. Every one misses the cache and hits the database.
-`GET /api/v1/events/999999999` in a loop is a trivial denial-of-service.
+`GET /api/v1/events/999999999` in a loop is a simple denial-of-service.
 
 Fix: **cache the "not found" answer too**, with a short TTL. Spring does this if you allow null caching
 — but be careful, because now a newly created id may return "not found" from the cache for a few
@@ -167,14 +166,11 @@ seconds.
 
 ### 4. Cache avalanche
 
-Everything expires at once (a mass reload, a restart, a shared TTL) and the entire load lands on the
-database simultaneously. Same fix as the stampede: jitter, plus warming critical keys on startup.
+If many entries expire together, many requests suddenly reach the database. This is a **cache avalanche**. Spread expiry times with jitter and preload important entries where useful.
 
 ## A5. Redis facts that change how you use it
 
-**Redis is single-threaded for command execution.** One command at a time, no locks, no race conditions
-*inside* Redis. This is why `INCR` and `SETNX` are atomic for free, and it is the foundation of the
-distributed lock in Phase 8.
+**Redis executes ordinary commands one at a time.** Commands such as `INCR` and `SETNX` complete as a single operation. However, a sequence of separate commands from your application can still have gaps between them. Phase 8 uses this distinction for locks.
 
 It also means **one slow command blocks everything**. `KEYS *` on a million keys is a production
 incident. Use `SCAN`.
@@ -186,31 +182,20 @@ on in Phase 1 because Phase 8 stores locks here.
 **Data types** worth knowing: `String` (any bytes — our JSON), `Hash` (field/value maps), `List`, `Set`,
 `Sorted Set` (leaderboards, delayed queues), plus TTL on any key.
 
-**Distributed vs local cache:** a local in-process cache (Caffeine) is faster still — nanoseconds, no
-network — but each instance has its own copy, so three instances mean three different stale versions and
-no way to invalidate them all. Redis is shared, so one `evict` affects everyone. For anything a user can
-change, use the shared cache.
+**Local cache:** each application instance keeps its own copy, avoiding a network call. **Shared Redis cache:** instances read the same copy, so removing an entry affects them all. Separate local caches need a way to learn about changes or they may show different old values.
 
 ## A6. Serialization — the trap nobody warns you about
 
-Something must turn your `Event` object into bytes for Redis. Spring's default is **JDK serialization**,
-which is wrong here for three reasons: the output is unreadable in `redis-cli`, it requires
-`implements Serializable` everywhere, and it breaks the moment a class changes.
+**Serialization converts an object into stored data.** Spring's default JDK format is hard to read in `redis-cli`, needs `implements Serializable`, and can cause compatibility problems when classes change. We use JSON for these cached responses.
 
 **Use JSON.** Readable, language-neutral, tolerant of added fields.
 
-**But JSON caching creates a versioning problem you must plan for.** Add a field to the DTO and deploy;
-old cached JSON has no such field. Jackson handles a *missing* field fine (null/default) — but an
-*unknown* field, when you remove one, throws unless you configure it not to.
+**Consider older cached JSON when changing a DTO.** A missing field normally becomes null or a default value. An extra field can cause a read error unless Jackson is configured to ignore unknown fields. Versioned cache keys help avoid mixing incompatible formats.
 
 **Rules:**
-1. **Cache DTOs, never entities.** An entity carries Hibernate proxies and lazy collections that do not
-   serialise sanely — and a deserialised entity is *detached*, so a stray `save()` on it can overwrite
-   real data.
-2. Configure Jackson to ignore unknown properties.
-3. **Put a version in the cache key prefix** (`events:v1:1`). Deploying a breaking DTO change then
-   means bumping to `v2`, and the old keys simply expire. This costs nothing now and saves a real
-   incident later.
+1. **Cache DTOs rather than JPA entities.** Entities can contain framework wrappers and unloaded relationships that are difficult to store as JSON. A restored entity is no longer tracked by its old Hibernate session, and saving it can overwrite newer data.
+2. Configure Jackson to ignore extra fields it does not recognise.
+3. **Version the cache-key prefix**, for example `events:v1:1`. If the format changes incompatibly, use `v2` and let old entries expire.
 
 ---
 
@@ -263,11 +248,9 @@ cache:
 ```
 
 **`timeout: 2000ms` is the setting that matters most.** Without it, a hung Redis makes every request
-wait indefinitely — the cache, which exists to make things faster, becomes the reason nothing responds.
+wait with no time limit — the cache, which exists to make things faster, becomes the reason nothing responds.
 
-Think about what the timeout means: **a cache lookup should never take longer than the database query
-it replaces.** If Redis needs more than 2 seconds, going to Postgres directly is strictly better. Some
-teams set it as low as 200 ms for exactly this reason.
+**A cache is meant to save waiting time.** Choose a short Redis timeout so a slow cache does not delay a request much longer than the database read it was meant to avoid. The example uses 2 seconds; some systems need a much shorter limit.
 
 ## Step 3 — Cache configuration
 
@@ -310,10 +293,7 @@ public class CacheConfig {
 }
 ```
 
-`@EnableCaching` switches on the caching **AOP proxies**. Without it, `@Cacheable` is an inert
-annotation and your code silently runs uncached — the same class of silent failure as a missing
-`@Transactional` (Phase 4, Drill 5). And it is AOP, so **the self-invocation trap applies**: calling a
-`@Cacheable` method from another method in the same class skips the cache entirely.
+`@EnableCaching` turns on Spring's caching wrappers, called **AOP proxies**. Without it, `@Cacheable` does not activate caching. **A call from one method to another in the same object skips that wrapper**, so it also skips the caching check. This is called the self-invocation problem.
 
 `JavaTimeModule` is required or `Instant` serialisation throws. Our `EventResponse` has three `Instant`
 fields, so this line is not optional.
@@ -352,16 +332,9 @@ serializer produces binary keys you cannot search or debug.
 
 `jsonSerializer()` for values — concept A6.
 
-**`disableCachingNullValues()`** — with it, a `null` return is not cached, which means `GET /events/999`
-hits the database every time: **cache penetration** (concept A4). We accept that here because our
-service throws `EventNotFoundException` rather than returning null, so nothing null ever reaches the
-cache. Know the trade: if you switch to returning `Optional.empty()`, enable null caching with a short
-TTL.
+**`disableCachingNullValues()` means missing values are not cached.** Our service throws `EventNotFoundException` for a missing event, so it does not return null to cache. Repeated `GET /events/999` calls therefore keep reaching the database. If you later return `Optional.empty()` and cache missing results, give them a short TTL so newly created data is not hidden for long.
 
-**`prefixCacheNameWith("ebp:v1:")`** — two wins. `ebp:` namespaces this app so several apps can share
-one Redis without colliding. **`v1:` is the schema version from concept A6** — change the cached DTO
-shape incompatibly and you bump to `v2:`, orphaning old keys instead of deserialising them into
-exceptions.
+**`prefixCacheNameWith("ebp:v1:")` gives keys an application name and a version.** `ebp:` keeps this application's keys separate from others. If a DTO changes incompatibly, change `v1:` to `v2:` so the application reads new entries while the old ones expire.
 
 **Different TTLs per cache** — 10 minutes for details, 60 seconds for lists. One TTL for everything is
 the usual lazy default and it is always wrong for something.
@@ -424,19 +397,11 @@ bean.
 
 **This class is the difference between "the cache is down" and "the site is down."**
 
-By default, a Redis failure throws and your request returns 500 — a service that worked perfectly well
-without a cache last week now fails *because* you added one. That is the opposite of what a cache is
-for. Swallowing the error means a Redis outage degrades you to Phase 4 performance. Slower, correct,
-alive.
+Without an error handler, Redis failure can make the request return 500. The handler lets the request use the database instead. Reads are slower while Redis is unavailable, but the cache does not prevent the application from doing its basic job.
 
-**Notice the log levels, and the reasoning behind them.** GET and PUT failures are `warn`: you lost
-speed. **EVICT failure is `error`**, because the database now holds new data and the cache holds old
-data with no invalidation — you are actively serving wrong answers until the TTL expires. Those two
-failures deserve different levels of panic.
+**The log level shows the kind of problem.** A failed GET or PUT usually loses speed, so it is logged as `warn`. A failed EVICT may leave old data visible after a database update, so it is logged as `error`.
 
-**The honest limit:** this makes reads and writes survive, but it cannot fix the staleness a failed
-evict causes. That is what TTL is for. **There is no configuration that gives you a cache with no
-consistency cost.**
+**Limit:** this error handler keeps requests running, but cannot remove an old entry while Redis is unreachable. The TTL limits how long that entry can stay once it is served again.
 
 ## Step 5 — Cache the read path
 
@@ -467,10 +432,7 @@ call getEventResponse(1)
    └─ return
 ```
 
-`key = "#id"` is **SpEL** referring to the parameter. Without an explicit key, Spring uses all
-parameters combined — fine here, dangerous when a method takes a `Pageable` or an object whose
-`hashCode` is not stable. **Always set the key explicitly**; an unstable key means a cache that never
-hits and quietly wastes memory.
+`key = "#id"` tells Spring to use the method's id parameter as the cache key. The expression language is called **SpEL**. Without a chosen key, Spring combines the parameters, which may be unsuitable for complex objects.
 
 The `log.debug` line is deliberate: it only prints on a miss, so your logs show you the hit rate for
 free.
@@ -493,15 +455,9 @@ entity for correctness.**
     }
 ```
 
-**The explicit key is doing real work here.** A `Pageable` has no cache-friendly `toString`, and if the
-sort field ends up in the key you get a separate entry for every sort combination a client tries — an
-unbounded key space an attacker can inflate deliberately. We key on page number and size only, which
-means **this cache is correct only for the default sort**. Note that in a comment; if you later expose
-sorting, the key must include it.
+**This key includes page number and size only.** It does not include sort settings, so the cached result is correct only for the default sort. If you later allow different sorting, include it in the key too. Otherwise two different queries may share the wrong result.
 
-**Why only 60 seconds?** This query says "published events starting after `Instant.now()`" — the answer
-changes as time passes, independently of any write. A long TTL would keep showing events that already
-started. **Time-dependent queries need short TTLs.** That is a subtle, real bug class.
+**The list uses a 60-second TTL because time changes the answer.** It includes only events after `Instant.now()`. An event can start even when nobody updates a row, so a long-lived copy could keep showing it as upcoming.
 
 Update the controller to call the cached methods.
 
@@ -531,10 +487,7 @@ Apply the same `@Caching` block to `publish` and `cancel`.
 **`@CacheEvict`, not `@CachePut`.** Concept A2 — delete, never update. A lost update race leaves a
 permanently wrong cached value; a delete leaves at worst one extra miss.
 
-**`allEntries = true` on the list cache.** We cannot know which page contains this event — publishing
-one can shift every page. Blowing away all list entries is crude and correct. The cost is bounded by
-the 60-second TTL: at most a minute of recomputation. **Crude and correct beats clever and wrong**, and
-if the cost ever hurts, the answer is a shorter TTL, not smarter invalidation.
+**`allEntries = true` clears every cached page of the list.** Changing or publishing an event can move items between pages, so clearing one page is not enough. Later requests rebuild the pages they need. This is simple, but increases database work after changes.
 
 **Now the part most people get wrong.** `@CacheEvict` runs when the method **returns**, and by default
 that is *before* the transaction commits.
@@ -547,9 +500,7 @@ cache evicted           ← here
 transaction commits     ← database updated here
 ```
 
-There is a window — small, but real — where the cache is empty and the database still holds the old
-row. A read landing in that window caches the **old** value, and now you are stale until TTL with no
-further eviction coming.
+A read can arrive after the cache entry is removed but before the database transaction commits. It may load the old database value and cache it again. That old copy can remain until expiry unless another removal happens.
 
 Setting `beforeInvocation = false` (the default) does not fix it; the ordering is the AOP proxy
 ordering, and the transaction proxy is on the outside. The robust fixes, in order of effort:
@@ -559,7 +510,7 @@ ordering, and the transaction proxy is on the outside. The robust fixes, in orde
    with an `afterCommit` callback.
 3. Publish a domain event on commit (Phase 11's outbox) and evict from its handler.
 
-**Know that this window exists and can name the fix.** That is a genuinely senior-level detail, and
+**Know that this window exists and can name the fix.** That is a really senior-level detail, and
 almost nobody mentions it unprompted.
 
 ## Step 7 — Run and watch it work
@@ -651,10 +602,7 @@ curl -s http://localhost:8080/api/v1/events/1 | jq -r .title
 
 Still the old title. For up to 10 minutes.
 
-**Nothing is broken.** The cache was never told. This is concept A4 in the flesh, and it is why *any*
-write path that bypasses your application — an admin script, a batch job, a second service — is a
-correctness problem, not just a style problem. **One writer, or explicit invalidation. There is no
-third option.**
+**The cache did not learn about the direct database change.** A script or another write path must also remove affected cache entries, or users can keep seeing old values until expiry. Prefer one controlled path for changes.
 
 Force it:
 
@@ -672,10 +620,7 @@ docker exec -it ebp-redis redis-cli KEYS 'ebp:v1:*'
 No key was created, and every one of those 20 requests reached Postgres. Now imagine 10,000 requests a
 second for random non-existent ids.
 
-**That is a working denial-of-service against your database, through a cache that appeared to be
-protecting it.** Fix: cache the negative result briefly, or validate ids at the edge, or a Bloom filter
-at large scale. Decide which, and understand why `disableCachingNullValues()` was a trade-off and not a
-default to copy blindly.
+Repeated missing-id requests can still overload the database. Options include briefly caching the missing result, checking id format before the query, or using a **Bloom filter**, a space-efficient check that can rule out many nonexistent ids. Understand this limit before copying `disableCachingNullValues()` into another service.
 
 ### Drill 4 — the stampede
 
@@ -712,7 +657,7 @@ the old keys become invisible immediately instead of poisoning every read.
 | Mistake | Symptom | Fix |
 |---|---|---|
 | Forgot `@EnableCaching` | Nothing is cached, no error | Add it |
-| `@Cacheable` called from the same class | Cache silently skipped | AOP self-invocation — call through another bean |
+| `@Cacheable` called from the same class | Cache without a clear error skipped | AOP self-invocation — call through another bean |
 | Caching entities instead of DTOs | Proxy/lazy errors; detached-entity writes | Cache DTOs |
 | JDK serialization | Unreadable keys, breaks on class change | JSON |
 | No `CacheErrorHandler` | Redis outage becomes a service outage | Log and fall through |
@@ -720,28 +665,23 @@ the old keys become invisible immediately instead of poisoning every read.
 | `@CachePut` on write | Lost-update race leaves a wrong value cached | `@CacheEvict` |
 | Caching volatile data (seat counts) | Overselling | Do not cache inventory |
 | One TTL for everything | Something is always wrong | Per-cache TTLs |
-| Implicit cache keys | Never hits, or unbounded key space | Explicit `key = "#id"` |
+| Implicit cache keys | Never hits, or without a limit key space | Explicit `key = "#id"` |
 | `KEYS *` in production | Blocks single-threaded Redis | `SCAN` |
 | `maxmemory-policy noeviction` | Writes rejected when full | `allkeys-lru` for a cache |
-| Writing to the database outside the app | Permanent staleness | One writer, or explicit invalidation |
+| Writing to the database outside the app | Permanent how out of date the data can be | One writer, or explicit invalidation |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **`maxmemory` + `allkeys-lru`.** Without a memory cap, Redis grows until the OOM killer intervenes.
-- **TTL jitter:** `ttl + random(0..10%)` so keys written together do not expire together.
-- **Monitor the hit rate** (`redis-cli INFO stats` → `keyspace_hits` / `keyspace_misses`). Below ~80%,
-  your caching is costing more than it saves.
-- **Redis Sentinel or Cluster** for high availability. A single Redis is a single point of *slowness*,
-  and with the error handler above, not a single point of failure.
-- **Never cache anything security-sensitive** — permissions, tokens — without very short TTLs. Stale
-  permissions are a vulnerability, not an inconvenience.
-- **Do not use the cache as a database.** If losing all keys causes data loss, that data was never
-  cache.
-- **Warm critical keys on startup** if a cold cache would overwhelm the database after a deploy.
-- **Watch out for `@Cacheable` on methods with side effects** — on a hit the body never runs, so any
-  logging, auditing or metric inside it silently disappears.
+- **Set `maxmemory` and an eviction policy such as `allkeys-lru`.** Redis should not keep growing until the operating system stops it for using too much memory.
+- **Spread expiry times with TTL jitter**, such as `ttl + random(0..10%)`, so entries written together do not all expire together.
+- **Measure cache hits and misses** using `redis-cli INFO stats`, including `keyspace_hits` and `keyspace_misses`. A low hit rate means many requests still use the database; check whether caching is helping.
+- **Consider Redis Sentinel or Cluster** for recovery from a failed Redis instance. Keep the database fallback even with these tools.
+- **Be careful with cached permissions and tokens.** Old permission data can allow access that should have been removed. Use suitably short lifetimes and a clear invalidation plan.
+- **Keep the database as the saved source.** Losing an ordinary cache should not lose business records.
+- **Preload important entries at startup** if many initial cache misses would overload the database. This is called warming the cache.
+- **Remember that `@Cacheable` skips the method body on a hit.** Logging, audit writes, or other work inside that method will also be skipped.
 
 ---
 
@@ -752,7 +692,7 @@ the old keys become invisible immediately instead of poisoning every read.
 - [ ] Cached values are readable JSON with a TTL counting down
 - [ ] Updating an event evicts its key
 - [ ] Redis down → service still serves reads (you removed the error handler and saw the 500)
-- [ ] You changed the database directly and watched the cache serve stale data for minutes
+- [ ] You changed the database directly and watched the cache serve out of date data for minutes
 - [ ] You reproduced cache penetration with a non-existent id
 - [ ] You reproduced a stampede with 50 parallel requests
 - [ ] You can explain why we do **not** cache `availableSeats`
@@ -765,8 +705,6 @@ the old keys become invisible immediately instead of poisoning every read.
 
 Event-service is complete and fast. Time for the service that has to **talk** to it.
 
-**Booking Service + OpenFeign:** synchronous service-to-service calls, how Feign turns an interface into
-HTTP, connect vs read timeouts, error decoding, propagating the correlation id and user identity across
-the hop, and — most importantly — the failure modes that make synchronous calls dangerous.
+**Next, Booking Service + OpenFeign:** create bookings and make HTTP calls to event-service. You will set waiting limits, handle failed responses, and forward the user details and request id. You will also see what happens when one service succeeds and the other fails.
 
 **Pre-reading for Phase 6:** synchronous vs asynchronous calls, and what a socket timeout actually is.

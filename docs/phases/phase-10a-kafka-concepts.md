@@ -4,18 +4,39 @@
 **Needs:** Phase 9 finished. Kafka running from Phase 1.
 **Pre-reading:** log-based messaging versus queue-based, in one paragraph.
 
-No Java in this doc. You will drive Kafka from the command line until the model is clear, then write
-producers and consumers in Phase 10b. Writing Kafka code before understanding partitions is how people
-end up with systems that lose ordering and cannot explain why.
+This guide uses terminal commands rather than Java. First, see how Kafka stores messages in partitions and how consumers track their place. Phase 10b then adds producers and consumers to the services.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase teaches Kafka using terminal commands before adding Java code. Kafka stores messages so services can read and handle them later. You will see where messages go, who reads them, and how readers keep their place.
+
+Example: booking-service sends a BookingCreated message. Event-service reads it and handles the seats. A separate email service could read the same message independently. Reading does not remove the message from Kafka.
+
+Words used in this phase:
+
+- **Broker:** a Kafka server that stores messages.
+- **Producer / consumer:** an application that sends messages / reads messages.
+- **Topic:** a named stream of messages, such as booking.events.
+- **Partition:** one ordered part of a topic. A topic can have several parts to spread work.
+- **Key:** a value used to choose the partition for a message.
+- **Offset:** a message's position in one partition.
+- **Consumer group:** consumers that divide a topic's partitions between them. Different groups read independently.
+- **Commit an offset:** save how far a consumer group has read.
+- **Lag:** how far the consumer is behind the messages already written.
+- **Retention / replay:** how long messages are kept / reading stored messages again.
+- **Rebalance:** moving partition assignments between consumers when group membership changes.
+
+Start with a topic, partition, and offset. Understand those three before the producer settings. Then follow the terminal exercises in order.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. What a message broker buys you
 
-Phase 6's arithmetic: booking-service calling event-service synchronously means
-`0.99 × 0.99 = 98%` availability, added latency, and failure propagating backwards.
+In Phase 6, booking-service waited for event-service to answer. That added waiting time and required both services to work during the request. Messages let us separate when the request is accepted from when the seat work finishes.
 
 With a broker in the middle:
 
@@ -33,53 +54,43 @@ booking ──▶ [ Kafka ] ──▶ event  event can be down for an hour and l
 |---|---|---|
 | Both parties up at once | required | not required |
 | Caller waits | yes | no |
-| Failure propagates back | yes | no |
+| Failure spreads back | yes | no |
 | Adding a third consumer | change the producer | change nothing |
-| Ordering | trivial | needs design |
+| Ordering | simple | needs design |
 | Debugging | one stack trace | spread across services and time |
 | Consistency | immediate | eventual |
 
-**The last row is the price.** With a broker, "the booking exists" and "the seats are reserved" are true
-at *slightly different times*. Everything in Phases 11 and 12 is about making that gap safe.
+**The cost is delayed agreement.** A booking may exist before its seats have been reserved. Phases 11 and 12 make that period safe and show the user that confirmation is still pending.
 
-**The "adding a third consumer" row is the underrated one.** Today `BookingCreated` reduces seats.
-Tomorrow you want emails, then analytics, then fraud checks. Synchronously that is three edits to
-booking-service and three more sync dependencies. With Kafka, three new consumers subscribe and
-booking-service never learns they exist.
+**New services can react without changing booking-service.** For example, email and reporting services can each read `BookingCreated`. Booking-service does not need to call them one after another.
 
 ## A2. Commands and events, domain and integration
 
-Two distinctions that keep event-driven systems from turning into RPC with extra steps.
+First separate instructions from facts. Then separate messages used only inside a service from messages shared between services.
 
-**Command** — "do this." Directed at one handler, may be rejected, imperative name: `ReserveSeats`.
+**Command:** asks a receiver to do something. `ReserveSeats` is an instruction. The receiver may accept or reject it.
 
-**Event** — "this happened." A fact, in the past tense, already true, aimed at nobody in particular:
-`BookingCreated`. Anyone may listen. Nobody may reject it.
+**Event:** reports something that already happened. `BookingCreated` means the booking was created. Other services may react to the fact, but cannot change whether it happened.
 
-**Publish events, not commands, between services.** A command over a broker is a synchronous call
-wearing a disguise: the sender still knows who must act and still cares about the outcome — the coupling
-survives, and you lost the stack trace.
+**This project uses events between services.** A message such as `BookingCreated` reports a fact without calling a particular receiver. Commands over messaging are also a design choice, but they keep an explicit expectation about which service should act.
 
 **Domain event vs integration event** — the distinction that saves you later:
 
-- **Domain event** — internal to one service. Rich, tied to your model, changes freely.
-  `SeatsReserved(Event aggregate, ...)`.
-- **Integration event** — crosses the service boundary. **It is a public API contract.** Minimal, stable,
-  versioned, no internal types.
+- **Domain event:** used inside one service. It can refer to internal model objects, such as `SeatsReserved(Event aggregate, ...)`.
+- **Integration event:** sent to other services. It is an agreed data format, kept small and stable, without internal Java types.
 
 ```
 Event aggregate → domain event (internal) → mapped → integration event (published)
 ```
 
-Publishing your domain events directly is the same mistake as returning your JPA entity from a
-controller. Everything you emit becomes something you cannot change.
+If you publish an internal domain object, consumers can become dependent on its fields and structure. Use a separate message format so internal classes can change without unexpectedly breaking another service.
 
 **Naming: past tense, always.** `BookingCreated`, not `CreateBooking`. If the name reads as an
 instruction, you have a command and you should ask why it is on a topic.
 
 ## A3. Kafka's model
 
-Kafka is **not a queue**. It is a **distributed, append-only, replayable log**.
+Kafka stores messages in a **log**: new records are added at the end, and existing records can be read again while retained. It spreads the log across servers and partitions. Reading a record does not remove it.
 
 ### The log
 
@@ -91,21 +102,20 @@ Partition 0:  [0][1][2][3][4][5][6]  ← append-only, never modified
                 offset=3         offset=6
 ```
 
-**Messages are not deleted when read.** They stay for the retention period. Each consumer group tracks
-its own **offset** — its position in the log.
+**Reading does not delete a message.** Kafka keeps it according to the topic's storage rules. Each consumer group saves its own offset, so groups can read the same records at different speeds.
 
 Consequences that make Kafka different from RabbitMQ or SQS:
 
-- **Many independent consumers** read the same messages at their own pace.
-- **Replay** — reset the offset to 0 and reprocess a week of history. Priceless for fixing a consumer bug.
-- **Reads are sequential disk reads**, which is why it is fast despite writing everything to disk.
+- **Independent groups** can read the same messages at their own speed.
+- **Replay:** move the reading position back and process retained messages again, for example after fixing a bug.
+- **Sequential reads:** reading records in order helps Kafka handle large amounts of data efficiently.
 
 ### Broker, cluster, topic, partition
 
-- **Broker** — one Kafka server. Ours is a single-node cluster from Phase 1.
-- **Topic** — a named stream: `booking.events`.
-- **Partition** — a topic is split into partitions. **This is the unit of parallelism and of ordering.**
-- **Offset** — a message's position within one partition. Unique per partition, not global.
+- **Broker:** one Kafka server. Locally we run one broker from Phase 1.
+- **Topic:** a named stream, such as `booking.events`.
+- **Partition:** one ordered part of a topic. Different partitions can be handled at the same time.
+- **Offset:** a record's position within one partition. It is not a position across all topics or partitions.
 
 ```
 Topic: booking.events (3 partitions)
@@ -124,10 +134,9 @@ Everything else about partitions follows from that one sentence.
 partition = murmur2(key) % numberOfPartitions
 ```
 
-Same key → same partition → **ordered relative to each other**. No key → round robin → no ordering.
+With a stable partition setup, the same key goes to the same partition. Records in that partition have an order. Records without a shared key do not give us the per-event ordering this application needs.
 
-**This is the most important design decision you make with Kafka.** For our events the key is the
-**event id**, so every message about event 42 lands in one partition and is processed in order.
+**The key decides which messages stay together.** We use the event id, so messages for event 42 go to the same partition and can be read in that partition's order.
 
 Consider what happens without it:
 
@@ -136,15 +145,11 @@ Partition 0:  SeatsReserved(event=42, qty=2)
 Partition 1:  EventCancelled(event=42)
 ```
 
-Two consumers, two partitions, no ordering between them. The cancellation may be processed before the
-reservation. **The bug is not in your code — it is in your partition key**, and it will be intermittent
-and nearly impossible to reproduce.
+If related messages go to different partitions, consumers can handle a cancellation before the reservation it refers to. The code may look correct, but the message order is wrong for the workflow.
 
-**Choosing the key means choosing what must stay ordered.** Key by event id and all messages for one
-event are ordered while different events process in parallel. That is exactly the trade you want.
+**Choose the key from the work that needs ordering.** Here, messages about one event should stay together. Messages about different events can be handled at the same time.
 
-**The cost:** a very hot key (one enormously popular event) sends all its traffic to one partition, and
-that partition becomes your bottleneck. Ordering and parallelism are genuinely in tension.
+**A popular event can overload one partition.** Keeping all its messages ordered also limits how much of that work can run in parallel. More partitions do not automatically split one key's work.
 
 ### Consumer groups
 
@@ -159,16 +164,12 @@ Group "analytics" with 1 consumer:
   consumer-1 → P0, P1, P2      ← reads the SAME messages independently
 ```
 
-**Within a group:** each partition goes to exactly one consumer. Work is divided.
-**Across groups:** every group gets every message. Work is duplicated by design — this is pub/sub.
+**Within one group:** consumers divide partitions, so they share the work.
+**Between different groups:** each group reads the messages independently, so event handling and email handling can both see the same record.
 
-**The rule that surprises people: consumers beyond the partition count sit idle.** Three partitions and
-five consumers means two do nothing. **Partition count is your maximum parallelism**, chosen when the
-topic is created and awkward to raise later (raising it changes `hash % n` and therefore breaks existing
-key→partition assignments).
+**Extra consumers do not always add capacity.** In the group model used here, one partition belongs to one consumer at a time. With 3 partitions and 5 consumers, 2 consumers have no partition to read. Adding partitions later can change which partition a key uses.
 
-`group.id` is what identifies a group. **Two services accidentally sharing a `group.id` will each
-receive only half the messages**, and it looks like random message loss. Name groups after the service.
+**Give independent services different `group.id` values.** Services that accidentally share a group divide the records instead of each reading them all. The missing records can then look like message loss.
 
 ### Rebalancing
 
@@ -180,12 +181,9 @@ c2 dies
 after:   c1 → P0,P1,P2
 ```
 
-During a rebalance, **consumption stops** ("stop the world"). Long rebalances are a real production
-problem. The usual cause: a consumer takes longer than `max.poll.interval.ms` (default 5 minutes) to
-process a batch, so the broker assumes it is dead and rebalances — the consumer then finds its
-partitions revoked mid-work.
+When partitions are reassigned, processing can pause. If processing takes longer than `max.poll.interval.ms` (5 minutes in this example), the consumer may lose its assignment. Another consumer can then take over, even though the old one was still doing work.
 
-**Slow consumers cause rebalance storms.** Keep processing fast, or lower `max.poll.records`.
+**Keep processing times under control.** Smaller batches through `max.poll.records` can help a slow consumer keep polling in time and avoid repeated reassignment.
 
 ## A4. Producer guarantees
 
@@ -193,34 +191,26 @@ partitions revoked mid-work.
 
 | Setting | Meaning | Risk |
 |---|---|---|
-| `acks=0` | do not wait at all | messages silently lost |
+| `acks=0` | do not wait at all | messages without a clear error lost |
 | `acks=1` | leader wrote it | lost if the leader dies before replication |
 | `acks=all` | leader **and** all in-sync replicas wrote it | slowest, safest |
 
-**`acks=all` combined with `min.insync.replicas=2`** is the durable configuration: a write must reach at
-least two replicas or it fails. With `replication.factor=3` you survive one broker loss with no data
-loss.
+**`acks=all` asks Kafka to acknowledge after the current in-sync replicas have accepted the record.** With `min.insync.replicas=2` and `replication.factor=3`, writes need at least two in-sync copies. This protects against one broker loss under the expected failure conditions.
 
 **Our single-node dev cluster has `replication.factor=1`** (Phase 1), so `acks=all` is effectively
 `acks=1`. Set it correctly anyway — config that is wrong in dev is config that ships.
 
 ### The idempotent producer
 
-`enable.idempotence=true` (the default in modern clients) makes the **broker** deduplicate retries from
-one producer session, using a producer id and a sequence number per partition.
+`enable.idempotence=true` lets Kafka recognise retries by the producer using a producer id and sequence numbers. This prevents those retries from adding the same record again.
 
-**It solves exactly one problem: a producer retry writing the same message twice.** It does **not** make
-your consumer idempotent, and it does not deduplicate two genuinely separate `send()` calls with the
-same content. Phase 9's consumer-side dedup is still required. People conflate these constantly.
+**Producer duplicate protection has a limited job.** It does not stop your application from making two separate `send()` calls, and it does not stop a consumer from applying a database change twice. We still need the checks from Phase 9.
 
 ### Batching
 
-The producer accumulates messages for up to `linger.ms` and sends them as one batch. Higher `linger.ms`
-= better throughput, worse latency. **The `send()` call is asynchronous** — it returns a future, and the
-message is still in a buffer.
+The producer can collect messages briefly, up to `linger.ms`, and send them together. Bigger batches can handle more messages per second but add waiting time. `send()` returns a future; returning from the method does not prove Kafka has saved the message.
 
-**This matters enormously in Phase 11.** A `send()` that "succeeded" from your code's point of view may
-not be on the broker yet. If the process dies, it is gone. That is half the dual-write problem.
+**Keep this in mind for Phase 11:** the message may still be in application memory after `send()` returns. If the process stops before Kafka accepts it, that message can be lost.
 
 ## A5. Consumer guarantees and the commit order
 
@@ -234,79 +224,62 @@ while (true) {
 }
 ```
 
-**Where you commit decides your delivery guarantee, and there is no third option:**
+**The order of processing and saving the offset decides what happens after a crash:**
 
-**Commit *after* processing → at-least-once.** Crash between processing and commit → the message is
-redelivered → processed twice. **Duplicates.**
+**Save the offset after processing:** a crash between the work and offset save can cause the record to be delivered again. The work must be safe to repeat. This is at-least-once handling.
 
-**Commit *before* processing → at-most-once.** Crash after commit, before processing → never
-redelivered. **Loss.**
+**Save the offset before processing:** a crash after the offset save can leave work undone, and the group has already moved past the record. This can lose work.
 
 ```
 at-least-once:  poll → process → commit     duplicates possible
 at-most-once:   poll → commit → process     loss possible
 ```
 
-**Choose at-least-once, always, for anything that matters** — then make the consumer idempotent (Phase
-9). Losing a booking is unacceptable; processing one twice is merely a problem you already solved.
+**For bookings, allow repeat delivery and prevent duplicate changes.** A missed booking is unacceptable; the same message arriving again is manageable with Phase 9's saved message ids.
 
-**Auto-commit (`enable.auto.commit=true`) is the trap.** It commits on a timer, unrelated to your
-processing, so you get *both* failure modes depending on timing. Spring Kafka defaults to manual
-acknowledgement modes for this reason.
+**Do not use timer-based auto-commit for this flow.** `enable.auto.commit=true` can advance the reading position without matching the completion of your work. Choose a Spring Kafka acknowledgement mode that commits after processing, as Phase 10b demonstrates.
 
 ### Kafka's "exactly-once"
 
-Kafka does offer exactly-once semantics — transactions spanning consume-process-produce **within
-Kafka**. Read a message, produce a result, commit the offset, all atomically.
+Kafka transactions can group reading, producing new Kafka records, and saving offsets into one operation within Kafka. This is the boundary of Kafka's exactly-once support.
 
-**It does not extend to your database.** The moment your consumer writes to Postgres, that write is
-outside Kafka's transaction. So for us: **at-least-once delivery + idempotent consumer** (Phase 9,
-concept A3). Say that sentence in an interview and you have answered the question properly.
+**A Postgres write is outside that Kafka transaction.** Our consumers therefore still need repeat delivery plus duplicate checks saved with their database work, as described in Phase 9.
 
 ## A6. Retention, compaction, and replay
 
-**Retention** — how long messages are kept. `retention.ms` (default 7 days) or `retention.bytes`. After
-that they are deleted regardless of whether anyone read them.
+**Retention** is how long, or how much, Kafka keeps. `retention.ms` sets a time limit (7 days in this example); `retention.bytes` sets a size limit. Records can be removed even if a consumer has not read them.
 
-**Compaction** (`cleanup.policy=compact`) — instead of deleting by age, keep **the latest message per
-key** forever. The topic becomes a snapshot of current state rather than a history of changes. Perfect
-for "current price of every event"; wrong for "everything that happened".
+**Compaction** (`cleanup.policy=compact`) removes older values for the same key over time, keeping the latest retained value. This helps build a current view, such as the latest event price. It is unsuitable when every historical change must remain.
 
-**Replay** is Kafka's superpower and worth internalising:
+**Replay** means moving the consumer's position back and reading retained records again:
 
 ```bash
 kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
   --group event-service --topic booking.events --reset-offsets --to-earliest --execute
 ```
 
-Ship a consumer bug, fix it, reset the offset, reprocess a week of events. **Only safe if your consumer
-is idempotent** — which is why Phase 9 came first. Replay against a non-idempotent consumer duplicates a
-week of data.
+After fixing a consumer bug, you can read past messages again. Make the database effects safe to repeat first, or replay can duplicate earlier changes.
 
 ## A7. Failure handling: retries and the dead letter topic
 
 A consumer throws. Then what?
 
-**Blocking retry** — retry in place, with backoff. Simple, but the partition is **stuck**: nothing behind
-that message is processed. One poison message halts a whole partition.
+**Blocking retry:** retry the failing message before continuing. This preserves its place in the order, but later messages in that partition wait too. A message that always fails can stop progress.
 
-**Non-blocking retry** — publish to a retry topic with a delay and move on. Ordering within the
-partition is lost for that message. Spring Kafka's `@RetryableTopic` implements this.
+**Non-blocking retry:** move the message to a retry topic and continue with later records. `@RetryableTopic` provides this in Spring Kafka. The retried record may then be handled after records originally behind it.
 
-**Dead Letter Topic (DLT)** — after N failed attempts, publish to `booking.events.DLT` and commit the
-offset so the partition moves on.
+**Dead Letter Topic (DLT):** after the allowed failures, put the record in a separate topic such as `booking.events.DLT` and let the main partition continue. The failed work still needs attention.
 
 ```
 booking.events ──fail──▶ booking.events.retry.1s ──fail──▶ .retry.5s ──fail──▶ .DLT
 ```
 
-**A DLT is not a bin. It is an inbox.** Messages there represent work that did not happen. **Alert on
-it.** A DLT nobody monitors is silent data loss with extra steps.
+**Monitor the DLT.** A record there means some work did not finish. Someone or a recovery process must inspect it, fix the cause, and decide whether to retry it.
 
 **Distinguish the two failure kinds before choosing:**
 
-- **Transient** (database down, network blip) — retry. It will work later.
-- **Permanent** (malformed message, an event id that never existed) — retrying forever is pointless.
+- **Temporary** (database down, network blip) — retry. It will work later.
+- **Permanent** (incorrectly formatted message, an event id that never existed) — retrying forever is pointless.
   Straight to the DLT.
 
 ## A8. Topic design for our system
@@ -314,14 +287,9 @@ it.** A DLT nobody monitors is silent data loss with extra steps.
 **Naming:** `<domain>.<type>` — `booking.events`, `event.events`. Consistent, greppable, and it groups
 in tooling. Some teams add the version: `booking.events.v1`.
 
-**Granularity — one topic per aggregate, not per event type.** `booking.events` carries
-`BookingCreated`, `BookingCancelled` and `BookingConfirmed`, discriminated by a header or a `type`
-field.
+**Group related event types in a topic.** `booking.events` contains `BookingCreated`, `BookingCancelled`, and `BookingConfirmed`. A field or header identifies which type a record contains.
 
-Why: **ordering is per partition, and per partition means per topic.** `BookingCreated` and
-`BookingCancelled` on separate topics have no ordering relative to each other, so a cancellation can be
-processed before the creation it cancels. One topic per aggregate keeps a single ordered stream per
-entity.
+**Separate topics do not provide one shared order.** Putting creation and cancellation in the same topic with the same key lets a consumer read them in partition order. Putting them on separate topics removes that ordering guarantee.
 
 **Our topics:**
 
@@ -330,10 +298,7 @@ entity.
 | `booking.events` | eventId | booking-service | event-service | `BookingCreated`, `BookingCancelled` |
 | `event.events` | eventId | event-service | booking-service | `SeatsReserved`, `SeatsRejected`, `EventCancelled` |
 
-**Both keyed by `eventId`, not `bookingId`** — deliberately. Seat availability is contested per *event*,
-so all messages about one event must be ordered relative to each other. Keying by booking id would let
-two bookings for the same event be processed in parallel by different consumers, which is exactly the
-ordering we need to preserve.
+**We key both topics by `eventId`, not `bookingId`.** Seat changes compete for the same event. Messages for that event must stay together even when they concern different bookings.
 
 **Event payload design — thin or fat:**
 
@@ -341,39 +306,31 @@ ordering we need to preserve.
   synchronous coupling you were escaping.
 - **Fat** (all the fields a consumer needs) — self-contained, replayable, no callback.
 
-**Prefer fat events**, containing what consumers need and nothing internal. A fat event is a fact frozen
-in time; a thin one is a pointer to mutable state that may have changed by the time it is read.
+**Include the fields needed to handle the event.** A message containing only an id can force the consumer to make another waiting call for details. A self-contained message also keeps the values as they were when the event happened.
 
 **Schema and versioning — this is a public contract:**
 
-- Adding an optional field: safe.
-- Removing or renaming a field: breaking. Old consumers are still running, and old messages are still in
-  the log.
-- **Always include `eventId` (a unique message id), `eventType`, `occurredAt` and a schema `version`.**
-  The message id is what Phase 9's `processed_messages` deduplicates on.
+- **Adding an optional field** usually keeps old consumers working.
+- **Removing or renaming a field** can break running consumers and replay of older records.
+- **Include a unique message id, `eventType`, `occurredAt`, and a format `version`.** Some designs call the message id `eventId`; this project's envelope uses `messageId` and keeps the business event id separately. The unique message id supplies the duplicate check in `processed_messages`.
 
-For real systems: a schema registry (Avro or Protobuf) enforces compatibility at publish time. JSON with
-discipline is fine here, and the discipline is the point.
+In a larger system, a **schema registry** records message formats and checks whether changes are compatible. Avro and Protobuf are common formats used with it. This project uses JSON and reviewed rules for changing fields.
 
 ## A9. When not to use Kafka
 
-- **Request/response.** If you need an answer now, make an HTTP call.
-- **Low volume, simple routing.** RabbitMQ or SQS is simpler to run and reason about.
-- **Per-message priority or selective consumption.** Kafka reads a log in order; it has no priority
-  queue and no "give me the messages matching X".
-- **Very low latency single messages.** Batching adds milliseconds.
-- **When one service and one consumer would do.** Kafka is a distributed system you now have to operate.
+- **An immediate answer is required:** an HTTP request may be simpler.
+- **Only a small amount of work needs simple routing:** consider whether RabbitMQ or SQS is easier to operate.
+- **Each message needs priority or special selection:** Kafka's ordered partition log is not a priority queue.
+- **Single-message delay must be extremely small:** batching can add waiting time.
+- **One simple service would solve the problem:** adding Kafka also adds a system to run, monitor, and recover.
 
-**Kafka vs RabbitMQ in one line:** RabbitMQ is a *broker* that routes messages to consumers and deletes
-them; Kafka is a *log* that stores them and lets consumers track their own position. Replay, multiple
-independent consumers and high throughput favour Kafka; complex routing, priorities and per-message
-acknowledgement favour RabbitMQ.
+**Main difference:** a typical RabbitMQ work queue removes messages after acknowledgement. Kafka keeps records according to its storage rules, and each consumer group keeps its own reading position. Choose based on whether the job needs replay and independent readers or more specialised per-message routing.
 
 ---
 
 # PART B — Drive Kafka by hand
 
-Kafka is running from Phase 1. Everything below is CLI — build the mental model before writing code.
+Kafka is already running from Phase 1. **CLI** means command-line interface: you will use terminal commands below to see its behaviour before adding application code.
 
 Shorthand for the container:
 
@@ -398,9 +355,7 @@ Topic: booking.events  PartitionCount: 3  ReplicationFactor: 1
   Topic: booking.events  Partition: 2  Leader: 1  Replicas: 1  Isr: 1
 ```
 
-**Read it:** three independent logs. `Leader: 1` — broker 1 handles all reads and writes for each
-partition. `Isr` (in-sync replicas) has one entry because we have one broker. In production this would
-be `Isr: 1,2,3`, and `acks=all` would mean "all three wrote it".
+**The output describes three separate partition logs.** `Leader: 1` means broker 1 leads that partition. `Isr` lists copies currently in sync; our single-broker setup has only one. A production list could show `Isr: 1,2,3`, with `acks=all` waiting for the current in-sync copies.
 
 **Three partitions means at most three consumers in a group can work in parallel.**
 
@@ -510,9 +465,7 @@ kafka/kafka-consumer-groups.sh --bootstrap-server localhost:9092 \
 
 Restart a consumer: **every message arrives again**. Nothing was deleted, so nothing was lost.
 
-**Sit with what this makes possible.** A consumer bug that corrupted a week of data is fixable: deploy
-the fix, reset, reprocess. No other messaging system gives you that. And it only works because your
-consumer is idempotent — Phase 9, doing its job.
+**Replay helps repair processing bugs.** After fixing the consumer, move its offset back and read the retained records again. The business effects must be safe to repeat, as in Phase 9, or replay can create duplicate changes.
 
 ## Step 6 — Retention and compaction
 
@@ -538,9 +491,7 @@ kafka/kafka-topics.sh --bootstrap-server localhost:9092 \
   --config cleanup.policy=compact
 ```
 
-Send `1:{"seats":100}` then `1:{"seats":98}` then `1:{"seats":95}`. After compaction only the last
-message for key `1` survives. **A history topic versus a state topic** — one keeps everything that
-happened, the other keeps what is currently true.
+Send `1:{"seats":100}`, then `1:{"seats":98}`, then `1:{"seats":95}`. After compaction catches up, the newest value for key `1` remains. A history topic keeps changes; a compacted topic helps keep the latest value for each key.
 
 Set retention back to something sane before moving on.
 
@@ -566,7 +517,7 @@ kafka/kafka-topics.sh --bootstrap-server localhost:9092 --list
 needs more than one partition, something is very wrong upstream.
 
 Auto-creation of topics exists (`auto.create.topics.enable`) and should be **off in production**: a typo
-in a topic name silently creates a new topic that nobody consumes, and the messages vanish into it.
+in a topic name without a clear error creates a new topic that nobody consumes, and the messages vanish into it.
 
 ---
 
@@ -576,7 +527,7 @@ in a topic name silently creates a new topic that nobody consumes, and the messa
 |---|---|
 | Kafka is a queue | It is a replayable log; messages survive being read |
 | Kafka guarantees ordering | Only **within one partition** |
-| More consumers = more throughput | Capped by partition count |
+| More consumers = more work completed per second | Capped by partition count |
 | Exactly-once is available end-to-end | Only within Kafka; your database side effects are outside it |
 | Idempotent producer makes consumers safe | It only dedups producer retries |
 | A message is delivered once | At-least-once means duplicates are normal |
@@ -588,19 +539,17 @@ in a topic name silently creates a new topic that nobody consumes, and the messa
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **`replication.factor=3`, `min.insync.replicas=2`, `acks=all`.** Anything less risks data loss on a
-  broker failure.
-- **Alert on consumer lag**, per group per partition. It is your early warning for everything.
-- **Alert on DLT depth.** Non-zero means work is not happening.
-- **Turn off topic auto-creation.** Create topics deliberately, with reviewed configuration.
-- **Choose partition count with room to grow** — increasing it later breaks key affinity.
-- **Schema registry** (Avro/Protobuf) for real contracts, or JSON with strict, reviewed rules.
-- **Monitor rebalance frequency.** Frequent rebalances usually mean slow consumers.
-- **Retention longer than your worst realistic outage.**
-- **Do not put personal data in events you keep forever** — GDPR deletion and infinite retention are
-  hard to reconcile. Compacted topics with tombstones are one answer.
+- **Use suitable replication settings**, such as `replication.factor=3`, `min.insync.replicas=2`, and `acks=all`, to keep copies and require enough in-sync replicas before accepting writes.
+- **Alert on consumer lag** for each group and partition. Growing lag means work is falling behind.
+- **Alert on messages in the DLT.** They represent work that did not complete.
+- **Create topics with reviewed settings** rather than relying on automatic creation.
+- **Choose enough partitions for expected growth.** Adding them later can change where an existing key goes.
+- **Check message compatibility** using a schema registry or clearly reviewed JSON rules.
+- **Watch rebalances.** Frequent partition reassignment may mean slow processing or unstable consumers.
+- **Keep messages longer than the longest outage you plan to recover from.** Otherwise unread messages can expire.
+- **Plan deletion needs before storing personal data in messages.** Long retention and replay make removal harder. Compacted topics can use tombstones, records marking a key for deletion, but this still needs careful handling.
 
 ---
 
@@ -624,11 +573,9 @@ in a topic name silently creates a new topic that nobody consumes, and the messa
 
 ## What Phase 10b does next
 
-Now the code. Spring Kafka producers and consumers, JSON serialisation, the event envelope
-(`messageId`, `type`, `occurredAt`, `version`), manual acknowledgement, error handling with
-`@RetryableTopic` and a DLT, and the idempotent consumer from Phase 9 wired to `processed_messages`.
+Next, add Java code using Spring Kafka. You will send and read JSON messages with an envelope containing `messageId`, `type`, `occurredAt`, and `version`. You will also choose when offsets are saved, handle failed messages with retries and a DLT, and connect the duplicate check to `processed_messages`.
 
-First events: `EventCreated` and `EventUpdated` — genuinely one-way notifications, so we can learn the
-plumbing before Phase 12 makes the booking flow depend on it.
+First events: `EventCreated` and `EventUpdated` — really one-way notifications, so we can learn the
+supporting code before Phase 12 makes the booking flow depend on it.
 
 **Pre-reading for Phase 10b:** none. Re-read your notes on partitions and keys instead.

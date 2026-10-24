@@ -2,15 +2,35 @@
 
 **Time:** 7–8 hours
 **Needs:** Phase 11 finished (outbox working in both services).
-**Pre-reading:** the CAP theorem in plain terms; what "eventual consistency" means to a user.
+**Pre-reading:** the CAP theorem in simple words; what "eventual consistency" means to a user.
 
-This is the phase the whole project has been building towards. The synchronous booking flow from
-Phase 6 gets replaced by an event-driven saga, and the hand-rolled `catch`-block compensation becomes a
-durable message.
+This phase connects the earlier lessons. Booking confirmation moves from waiting HTTP writes to messages. Recovery actions are saved so they can survive a restart, instead of existing only inside a `catch` block.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase replaces the waiting seat-reservation call from Phase 6 with a booking process carried by messages. The first response says the booking is pending. A later message confirms or rejects it.
+
+Example: booking-service saves a PENDING booking and a BookingCreated outbox message. Event-service reads the message and tries to reserve seats. Its reply lets booking-service change the status to CONFIRMED or REJECTED. If later work needs undoing, the system sends another saved message rather than relying only on a catch block.
+
+Words used in this phase:
+
+- **Saga:** a multi-step process using separate local transactions and recovery actions.
+- **Local transaction:** changes committed together inside one service's database.
+- **Compensation:** a new action that reverses the business effect of earlier work, such as releasing seats.
+- **Rollback:** cancelling changes that have not committed in a transaction.
+- **Eventual consistency:** services may briefly show different stages of the work, then agree after messages are handled.
+- **Choreography:** services react to each other's events without one central coordinator.
+- **Orchestration:** one coordinator tracks the process and asks services to perform each step.
+- **Terminal state:** a final status that does not move to another status.
+- **Timeout recovery:** finding work that has stayed pending too long and deciding how to recover it safely.
+
+Start with the PENDING → CONFIRMED or REJECTED flow. Then follow the failure and cancellation paths. The outbox and duplicate checks from earlier phases are required parts of this flow.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Why `@Transactional` stops at the service boundary
 
@@ -22,33 +42,26 @@ public void bookSeat() {
 }
 ```
 
-**The annotation covers one thing: one connection to one database.** The Feign call is not part of it.
-If `save` fails, the transaction rolls back — and the seats stay reserved, because nothing about that
-HTTP call is transactional.
+**`@Transactional` protects the local database work.** It does not make the Feign call part of the same transaction. If the local `save` fails, its changes roll back, but seats already reserved by event-service stay reserved.
 
-Two databases, two independent commits, no coordinator. Phase 6's Drill 3 proved it: seats leaked
-permanently and no `try/catch` could stop it, because the process can die between the two operations.
+There are two databases and two separate commits. In Phase 6, a failure between them left seats reserved without a booking. Error handling alone cannot close that gap because the process may stop before it runs.
 
-**And 2PC is not the answer** (Phase 11, concept A2): no HTTP API supports it, it blocks, and its
-coordinator is a single point of failure.
+Two-phase commit from Phase 11 needs participating systems and a coordinator. An ordinary Feign HTTP call is not part of that protocol. We use local transactions, saved messages, and recovery actions instead.
 
 ## A2. ACID, BASE, CAP
 
-**ACID** describes one database: Atomic, Consistent, Isolated, Durable. Within one service, keep it.
+**ACID** describes transaction guarantees: **Atomic** means all changes succeed or roll back together; **Consistent** means database rules are preserved; **Isolated** means concurrent work follows the chosen isolation rules; **Durable** means committed changes are kept after a restart. Keep these local database guarantees.
 
-**BASE** describes a distributed system: **B**asically **A**vailable, **S**oft state, **E**ventually
-consistent. Not a lesser goal — a different one, forced by physics.
+**BASE** is a way to describe systems that keep working while some data is temporarily unsettled: **Basically Available**, **Soft state**, **Eventually consistent**. For this project, the useful idea is that a booking can be accepted as pending while another service decides the seats.
 
-**CAP:** during a network **P**artition you may keep **C**onsistency or **A**vailability, not both.
+**CAP** describes a choice during a network split. If services cannot communicate, you cannot guarantee both a fully current shared view (**Consistency**) and a successful answer to every request (**Availability**). A **Partition** is the network break causing that choice.
 
-- **CP** — refuse writes until the partition heals. Correct, unavailable. (Banking ledgers.)
-- **AP** — keep accepting writes, reconcile later. Available, temporarily inconsistent. (Almost
-  everything else, including Eureka — Phase 1.)
+- **CP choice:** reject or delay affected requests rather than answer using a view that may disagree.
+- **AP choice:** keep answering where possible, accepting that different parts may temporarily disagree and need to be brought back into agreement.
 
-**Partitions are not optional.** Networks fail; the only choice is what you do when they do.
+**Networks can fail.** Decide which operations may continue during a split and which must wait. The choice depends on the data and business rule.
 
-**Our choice is AP**: accept the booking immediately, resolve the seats moments later. The user gets a
-response in 50 ms instead of waiting on two services.
+**Our booking flow accepts a pending request first and decides the seats later.** The response can be quick because it does not wait for the reservation to finish. Each service still uses database rules to protect its own changes. The example timings are illustrations, not guaranteed response times.
 
 ## A3. Eventual consistency, from the user's side
 
@@ -60,8 +73,7 @@ t+120ms  SeatsReserved published
 t+150ms  booking CONFIRMED
 ```
 
-**For 150 milliseconds the booking exists but the seats are not yet reserved.** That is the window, and
-it is a *product* decision, not just a technical one.
+**For a short time, the booking exists but the seats are not reserved yet.** The user must see that it is pending. This affects the product behaviour, not just the internal code.
 
 **Design for it rather than hiding it:**
 
@@ -70,13 +82,11 @@ it is a *product* decision, not just a technical one.
 - Give the client a way to see the outcome: poll `GET /bookings/{ref}`, or use WebSocket/SSE.
 - Make the UI honest: "Confirming your booking…" and then a result.
 
-**The honest framing:** you already live with this. Card payments are "pending" for days. A posted
-message shows a spinner. Users tolerate "in progress" perfectly well; what they hate is being told
-something succeeded when it did not.
+**Show progress honestly.** Users already see pending payments and messages still sending. Say "Confirming your booking…" while work is pending, then show the real result. Do not report success before the decision arrives.
 
 ## A4. What a saga is
 
-**A sequence of local transactions, each with a compensating transaction that semantically undoes it.**
+**A saga splits one workflow into local steps.** Each step commits in one service. If later work fails, a separate compensation action may be needed to reverse earlier business effects.
 
 ```
 FORWARD                              COMPENSATE (on failure)
@@ -85,22 +95,18 @@ FORWARD                              COMPENSATE (on failure)
 3. confirm booking            ──▶    (terminal, nothing to undo)
 ```
 
-Each step commits locally. **There is no global rollback** — instead, a later step failing triggers
-undo actions that are themselves local transactions.
+A completed local step stays committed. There is no one rollback covering the whole workflow. If needed, later steps perform separate undo actions, such as releasing seats.
 
 **"Compensate" is not "rollback", and the difference matters:**
 
-- Rollback erases history: the row never existed.
-- Compensation is a **new fact**: `CANCELLED`, `REFUNDED`, `RELEASED`. The original still happened and
-  is still visible.
+- **Rollback:** discards changes before that local transaction commits.
+- **Compensation:** records a new action after earlier work committed, such as `CANCELLED`, `REFUNDED`, or `RELEASED`. The earlier action still happened and can remain in the history.
 
-**Some things cannot be compensated.** You cannot un-send an email; you send an apology. You cannot
-un-charge instantly; you refund. **Order your saga so irreversible steps come last** — this is the
-single most useful design rule for sagas.
+**Some actions cannot be fully undone.** An email cannot be unsent. A completed charge needs a refund rather than a local rollback. Where possible, put irreversible steps near the end of the workflow.
 
 ## A5. Choreography or orchestration
 
-**Choreography** — each service listens for events and reacts. No central brain.
+**Choreography:** each service listens for relevant events and reacts. No central component tells every service what to do next.
 
 ```
 booking ──BookingCreated──▶ event-service
@@ -109,11 +115,10 @@ event ──SeatsReserved──▶ booking-service
                             confirms
 ```
 
-**Good:** no single point of failure, services stay decoupled, easy to add a listener.
-**Bad:** the flow exists nowhere as a whole. To understand it you read every service. Cycles are easy to
-create by accident, and hard to debug.
+**Benefit:** each service can react independently, and new listeners can be added.
+**Cost:** the complete workflow is spread across services. You must follow several handlers to understand it, and accidental message loops are harder to spot.
 
-**Orchestration** — one coordinator tells each service what to do and tracks progress.
+**Orchestration:** one coordinator records progress and asks services to carry out the steps.
 
 ```
         ┌─── BookingSaga (orchestrator) ───┐
@@ -123,13 +128,10 @@ create by accident, and hard to debug.
         └──────────────────────────────────┘
 ```
 
-**Good:** the flow is in one readable place, state is explicit, compensation logic is centralised,
-timeouts are easy.
-**Bad:** the orchestrator becomes a dependency for everyone, and can drift into a god service.
+**Benefit:** the steps, progress, timeouts, and recovery rules are easier to see in one place.
+**Cost:** the coordinator is another dependency and can become too large if it takes over other services' business rules.
 
-**Rule of thumb: choreography up to 3–4 steps, orchestration beyond that.** Our flow is two steps, so
-**choreography**. In an interview, say you would move to orchestration when payment and notification
-steps arrive — that shows judgement rather than dogma.
+**This project uses choreography for a small flow.** A rough guide is to consider a coordinator as steps and branches increase, often beyond three or four steps. Payment and notification steps would be reasons to reconsider the choice.
 
 ## A6. Our saga
 
@@ -171,24 +173,20 @@ POST /bookings
   tx: booking.reject()                    → REJECTED
 ```
 
-**Every arrow is an outbox row plus an idempotent consumer.** Nothing depends on a process staying
-alive:
+**Each arrow needs reliable sending and safe repeat handling:** an outbox saves outgoing work, and a consumer checks message ids before applying a repeated change.
 
 - Booking-service can die after the commit → the outbox row publishes on restart (Phase 11).
 - Event-service can be down for an hour → the message waits in Kafka (Phase 10).
 - Any message can arrive twice → `processed_messages` skips it (Phase 9).
 - Messages for one event are ordered → keyed by `eventId` (Phase 10a).
 
-**Read that list again.** Phases 9, 10, 11 were not separate topics; they were the four preconditions
-that make this diagram trustworthy. **A saga built without them is a saga that corrupts data.**
+**The earlier phases work together here.** Kafka stores messages, the outbox preserves messages waiting to be sent, duplicate checks prevent repeated database effects, and keys keep related records in partition order. The saga depends on all of these.
 
 ## A7. Stuck sagas
 
-The failure mode nobody plans for: a booking sits `PENDING` forever because a reply never came — the
-message was lost before the outbox existed, a consumer had a bug, a topic was misconfigured.
+**A booking can remain `PENDING` too long.** A reply may be delayed, a consumer may have a bug, or a topic may be configured incorrectly. Plan how to find and recover these bookings.
 
-**Every saga needs a timeout.** A scheduled job finds sagas older than N minutes still in a
-non-terminal state and compensates them:
+**Set a time limit for pending work.** A scheduled job looks for old unfinished sagas and starts the chosen recovery action:
 
 ```
 booking PENDING for > 5 minutes
@@ -197,12 +195,9 @@ booking PENDING for > 5 minutes
   → alert
 ```
 
-**Compensating a timed-out saga is itself risky**, and this is the subtle part: the reply may arrive
-*after* you compensate. Now seats are released and a `SeatsReserved` message says they are held.
+**A timeout does not prove the other service did nothing.** A successful reply might arrive after recovery has started. The recovery design must account for that late message as well.
 
-**That is why the state machine and idempotency matter.** `REJECTED → CONFIRMED` is not an allowed
-transition (Phase 6, step 5), so the late reply is rejected by the aggregate rather than corrupting it.
-**The state machine is your last line of defence against time itself.**
+**Check state transitions on late replies.** A `REJECTED` booking must not become `CONFIRMED` just because an old `SeatsReserved` message arrives. The state checks from Phase 6 reject that change. Seat-side recovery still needs its own correct handling.
 
 ---
 
@@ -242,22 +237,16 @@ transition (Phase 6, step 5), so the late reply is rejected by the aggregate rat
 
 **Compare this with Phase 6's version. Three things changed and all three matter:**
 
-**No `reserveSeats` call.** No synchronous write to another service. Booking-service's availability no
-longer multiplies with event-service's for the write path (Phase 6, concept A1).
+**The waiting `reserveSeats` write is removed.** Booking-service can accept pending work without waiting for event-service to reserve seats. Other dependencies, including the optional details read below, can still affect request handling.
 
 **The booking stays `PENDING`.** The constructor already sets it; we no longer call `confirm()`. The
 saga decides.
 
 **The insert and the outbox row commit together** — one transaction, one database (Phase 11).
 
-**The `getEvent` call is a read-only convenience.** It gives a fast, friendly error for an obviously
-wrong request. **It is not part of the saga's correctness** — the real decision is made by
-event-service's aggregate. If it fails, we could skip it and let the saga reject the booking instead;
-keeping it is a UX choice, and worth recognising as one.
+**`getEvent` is an early, read-only check.** It can give a quick error for an obviously invalid request. Event-service still makes the real reservation decision when it handles the saga message. Keeping the read improves feedback but still adds a waiting dependency to the current request.
 
-**`aggregateId` is the event id, not the booking id** — Phase 10a, concept A8. All messages about one
-event must be ordered relative to each other. Keying by booking id would let two bookings for the same
-event be processed out of order by different partitions.
+**Use the event id for `aggregateId`, not the booking id.** This supplies the Kafka key. Messages about seats for one event must stay together, even when they involve different bookings.
 
 **The controller returns 202:**
 
@@ -277,9 +266,7 @@ event be processed out of order by different partitions.
     }
 ```
 
-**`202 Accepted` with a `Location` header is the honest, standard answer** for "we took your request,
-the outcome is not decided yet, look here for the result." The client polls that URL until the status
-leaves `PENDING`.
+**Return `202 Accepted` and a `Location` header.** This says the request was accepted but confirmation is still pending. The client can call that URL to check until the booking leaves `PENDING`.
 
 Keep the Phase 9 idempotency wrapper around it — the double-click problem has not gone away.
 
@@ -373,32 +360,18 @@ public class BookingEventsConsumer {
 
 **This method is the heart of the saga. Five things are load-bearing:**
 
-**One transaction covers everything** — the dedup insert, the seat change, and the outbox row. All three
-commit or none do. If this transaction fails, the offset is not committed, the message is redelivered,
-and it is retried cleanly. **This single property is what makes the saga safe**, and it is exactly what
-Phase 10b's Drill 4 taught by breaking it.
+**Save all three changes in one transaction:** the processed-message id, seat change, and outbox reply. Either all commit or none do. If processing fails, do not advance the Kafka offset as though it succeeded. A later delivery can then retry the work safely.
 
-**A business rejection is not an exception here — it is an outcome.** The `catch` writes a
-`SeatsRejected` event and the transaction **commits normally**. Letting the exception escape would
-retry, fail identically, and eventually land in the DLT — while booking-service waits forever for a
-reply that will never come.
+**Not enough seats is a business outcome.** The handler writes `SeatsRejected` and commits that reply. Throwing the same business rejection repeatedly would retry a request that still cannot succeed and leave booking-service without its expected answer.
 
 **Distinguishing "the dependency is broken" from "the answer is no" is the skill.** A sold-out event is
 a valid answer; a database outage is not. Only the first should produce a reply.
 
-**`Event.reserveSeats()` is the Phase 4 aggregate method, unchanged.** All the invariants — status
-check, sufficiency, no negative seats — are enforced here without a single line being added. **This is
-the payoff for putting rules in the domain instead of in a controller.** The same method now serves HTTP
-and Kafka.
+**Reuse `Event.reserveSeats()` from Phase 4.** It still checks event status, enough seats, and valid counts. Those rules work for both HTTP and Kafka callers because they belong to the Event object.
 
-**`@Version` from Phase 8 is still protecting us.** Three consumer threads may process bookings for
-different events in parallel; two messages for the *same* event are in the same partition and therefore
-serialised. Optimistic locking is the backstop for the case where they are not.
+**`@Version` still detects competing row changes.** Different event keys can be processed in parallel, while messages for one event stay in one partition. The version check provides extra protection when another write path also changes that row.
 
-**No retry annotation here.** A `@RetryableTopic` would republish to a retry topic and **lose ordering**
-(Phase 10b, concept A4) — a reservation could be processed after a cancellation. Blocking retry via the
-container's error handler is the right trade for seat operations, because ordering matters more than
-throughput. **The opposite choice from Phase 10b, for a good reason.**
+**Do not use `@RetryableTopic` for this seat flow.** It moves retries to another topic and lets later records overtake them. Use blocking retry through the container error handler when preserving the order matters more than continuing past a failed record.
 
 ## Step 3 — Booking-service consumes the reply
 
@@ -456,13 +429,9 @@ late. The seats *are* reserved, but the booking is already dead.
 state machine caught a race against time**, and instead of corrupting the booking we publish
 `BookingCancelled` so the seats are released.
 
-**This is what "compensation" really looks like in a running system:** not a rollback, but a new fact
-that restores balance. And notice it was made possible by a design decision taken six phases ago, for
-different reasons.
+**Compensation is a new action that reverses an earlier effect.** It is not a rollback of a transaction already committed in another service. The state methods and messages let that recovery be recorded and handled separately.
 
-**`ifPresentOrElse` with an error log for an unknown booking.** That should be impossible; if it
-happens, something is deeply wrong (a wrong topic, a mixed-up environment) and you want it screaming in
-the log rather than silently ignored.
+**Log an unknown booking as an error in `ifPresentOrElse`.** A reply without a matching booking can indicate the wrong topic, environment, or reference. It needs investigation rather than being quietly skipped.
 
 ## Step 4 — Cancellation, both directions
 
@@ -508,9 +477,7 @@ the log rather than silently ignored.
 **Compare with Phase 6's cancel.** There, the release was a Feign call inside a `try/catch` that
 swallowed failures and left seats stranded whenever event-service was down.
 
-Now: the cancellation and the outbox row commit together, and the message is delivered **whenever
-event-service is available** — in a second or in an hour. **The compensation is durable.** That word is
-the entire difference between Phase 6 and Phase 12.
+**The cancellation and its outbox row now commit together.** If event-service is unavailable, the saved message can be sent and handled after it returns. This is what **durable compensation** means: the recovery action is saved so a restart does not erase it.
 
 **`releaseSeats` clamps at capacity** (Phase 4, step 6). That decision — made for tidiness back then —
 is what makes a duplicate release harmless now. Idempotent thinking in the domain pays off later, in a
@@ -730,7 +697,7 @@ Publish `BookingCancelled` **before** `BookingCreated` for the same booking, usi
 The cancellation releases seats that were never reserved — clamped at capacity, so harmless. The
 creation then reserves them. **Counts end up correct, by design.**
 
-Now do it with **different keys**, so they land on different partitions and are processed concurrently.
+Now do it with **different keys**, so they land on different partitions and are processed at the same time.
 Run it several times. **You can produce a wrong seat count**, because two threads interleave without
 ordering.
 
@@ -780,33 +747,27 @@ why Phase 9 came before Phase 10.
 | No saga timeout | Bookings `PENDING` forever | Timeout job + compensation |
 | No state machine | Late replies corrupt terminal bookings | Reject illegal transitions |
 | `@RetryableTopic` on ordered operations | Reservations processed after cancellations | Blocking retry where order matters |
-| Wrong partition key | Concurrent processing of related messages | Key by the contested aggregate |
+| Wrong partition key | Happening at the same time processing of related messages | Key by the contested aggregate |
 | Returning 201 for an async flow | Clients believe it is confirmed | 202 + `Location` |
 | Compensation only in a `catch` block | Nothing runs when the process dies | Compensation as a durable message |
 | Irreversible step early in the saga | Cannot compensate | Order irreversible steps last |
 | No correlation id in events | Undebuggable across services | Carry it in the envelope |
-| Choreography for a 7-step flow | Nobody can explain the flow | Orchestrate beyond 3–4 steps |
+| Choreography for a 7-step flow | Nobody can explain the flow | Coordinate beyond 3–4 steps |
 | Assuming replies arrive in order | Rare, timing-dependent corruption | Idempotency + state machine |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **A saga state table** for anything longer than two steps: saga id, current step, timestamps. Without
-  it, "which sagas are stuck?" is unanswerable.
-- **Dashboards for saga outcomes** — confirmed / rejected / timed out per minute. A rising timeout rate
-  is your earliest signal that something is broken.
-- **Alert on saga timeouts.** Every one is work you accepted and did not complete.
-- **An admin repair tool** — inspect a stuck saga and force compensation. `psql` at 3am is not a plan.
-- **Order steps so irreversible actions are last.** Charge the card after the seats are secured, not
-  before.
-- **Move to orchestration** when steps exceed three or four, or when the flow branches.
-- **Set the timeout from real data** — well above p99 completion time, or you will compensate sagas that
-  were about to succeed.
-- **Reconciliation:** periodically compare `sum(confirmed bookings)` against `capacity -
-  available_seats`. Distributed systems drift; find it before a customer does.
-- **Test compensation paths explicitly** (Phase 13). The happy path gets exercised constantly; the
-  compensation path runs only during incidents, which is the worst time to discover it is broken.
+- **Track longer sagas in a state table** with an id, current step, and times. This makes unfinished work easy to find.
+- **Measure outcomes:** confirmed, rejected, and timed-out bookings per minute. Changes in those rates can reveal failures.
+- **Alert on timeouts** because accepted work has not reached its expected outcome in time.
+- **Provide an admin repair tool** for inspecting stuck work and starting controlled recovery.
+- **Put irreversible actions near the end.** For example, secure seats before taking payment when that matches the business flow.
+- **Consider orchestration** when the workflow has many steps or branches.
+- **Set timeouts using measured completion times.** Leave room above p99, the time within which 99% of measured flows finish, so healthy but slower work is not timed out too soon.
+- **Check for data differences regularly.** Compare confirmed booking quantities with `capacity - available_seats` and investigate mismatches.
+- **Test compensation paths in Phase 13.** Recovery often runs during failures, so verify it before an incident occurs.
 
 ---
 

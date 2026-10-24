@@ -117,4 +117,16 @@ public class EventService {
                 EventResponse::from
         );
     }
+
+    @Transactional
+    public Event reserveSeats(Long eventId, int quantity) {
+        Event event = getById(eventId);
+        event.reserveSeats(quantity);
+        log.info("Reserved {} seats on event {} - {} remaining", quantity, eventId, event.getAvailableSeats());
+        return event;
+    }
+
+    @Transactional Event releaseSeats(Long eventId, int quantity) {
+        
+    }
 }

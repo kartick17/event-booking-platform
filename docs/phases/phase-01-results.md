@@ -13,10 +13,7 @@ Everything below was built and run with IntelliJ's bundled tools instead:
 - Maven: `/opt/idea-IU-262.8665.337/plugins/maven-plugin/lib/maven3/bin/mvn`
 - JDK: `/opt/idea-IU-262.8665.337/jbr/bin/java` (JBR 25.0.3)
 
-JDK 25 compiles to the release-21 target and runs release-21 jars, so the
-results are real. But this is a workaround, not a setup. Those paths break on
-the next IDE update, and the IDE runtime is not meant to be a project SDK.
-Install real Java 21 and Maven before Phase 2.
+JDK 25 built code for Java 21 and ran the Java 21 jars, so the checks below did run successfully. However, this setup uses tools bundled with the IDE. Their paths may change after an IDE update. Install a separate Java 21 JDK and Maven before Phase 2.
 
 ---
 
@@ -52,8 +49,7 @@ $ mvn -q validate
 [ERROR] Child module .../services/auth-service/pom.xml does not exist
 ```
 
-**Result: PASS.** That error is the expected one — it proves the reactor reads
-the `<modules>` list.
+**Result: PASS.** This error was expected. It shows that Maven read the `<modules>` list and tried to find the modules.
 
 After both module POMs were written:
 
@@ -175,9 +171,7 @@ app: AUTH-SERVICE
   healthCheckUrl: http://192.168.1.110:8081/actuator/health
 ```
 
-**Result: PASS.** The IP is registered instead of the hostname, which is
-`prefer-ip-address: true` doing its job. The 30/90 lease numbers match the
-timing table in the concepts section.
+**Result: PASS.** Eureka lists the IP address rather than the computer name because `prefer-ip-address: true` is set. The 30/90 values are the heartbeat interval and registration expiry time from the guide.
 
 ---
 
@@ -210,11 +204,7 @@ setting keeps them apart; with the default id they could have collided.
 Stopped the 8091 copy. The registry dropped to one instance **immediately**,
 not after the 5–15 s the doc predicts.
 
-Reason: this was a graceful shutdown. Spring Boot's shutdown hook sends an
-explicit unregister (DELETE) to Eureka, so no lease has to expire. The 5–15 s
-dev figure (and the 90 s + 60 s production figure) applies to a *hard* kill —
-`kill -9`, a crash, a yanked network cable — where the server can only notice
-that heartbeats stopped arriving.
+This was a normal shutdown, so Spring Boot told Eureka directly to remove the service using DELETE. Eureka did not need to wait for missing heartbeats. The longer times in the guide apply when a service stops without sending that message, such as after `kill -9`, a crash, or a lost network connection.
 
 **Result: PASS**, with that correction to expectations.
 
@@ -242,8 +232,7 @@ cache! This periodic background refresh will be retried in 30 seconds.
 
 Still serving normally 35 s later.
 
-**Result: PASS.** Eureka being down stops new information from spreading. It
-does not stop traffic. This is the AP choice in practice.
+**Result: PASS.** The running service still answered requests while Eureka was stopped. Eureka could not share new addresses, but stopping it did not stop this service.
 
 ### Drill 3 — service running before Eureka
 
@@ -260,9 +249,7 @@ started fresh.
 **Result: PASS.** Re-registered by itself 16 seconds after Eureka returned, with
 no restart. Startup order does not matter.
 
-The 16 s is the heartbeat cycle: the client heartbeats every 30 s, the fresh
-Eureka answers 404 because it has never heard of this instance, and a 404 on
-heartbeat makes the client register again.
+The client sends a heartbeat every 30 seconds. After Eureka restarted with an empty list, it answered a heartbeat with 404 because the instance was unknown. The client then registered again. In this run that took 16 seconds.
 
 ---
 
@@ -280,7 +267,7 @@ heartbeat makes the client register again.
 - [ ] Can explain, out loud: registration, heartbeat, lease expiry, registry
       fetch, client-side load balancing
 
-**9 of 10.** The last one is not something a command can prove.
+**9 of 10.** Commands can check the running system. The final item asks you to explain what you learned in your own words.
 
 ---
 

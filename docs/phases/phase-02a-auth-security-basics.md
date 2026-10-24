@@ -4,13 +4,33 @@
 **Needs:** Phase 1 finished (Eureka up, Postgres up, auth-service registering).
 **Pre-reading:** hashing vs encryption.
 
-At the end of this doc you can register a user and log in. **No JWT yet** — that is Phase 2b, on
-purpose. Trying to learn the Spring Security architecture and JWT at the same time is how people end
-up copy-pasting a `SecurityConfig` they cannot explain.
+By the end, a user can register and log in. **JWT comes in Phase 2b.** First, learn how Spring Security checks a password and records the current user. Learning these separately makes the security configuration easier to understand.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase teaches the application to recognise a user and check their password safely. A person can register and log in. JWT tokens come in Phase 2b, after you understand the login process.
+
+Think of two checks at a venue: first prove who you are, then show that your ticket allows you into a particular area. Login and permissions are separate checks in the same way.
+
+Words used in this phase:
+
+- **Authentication:** checking who the user is.
+- **Authorization:** checking what that user is allowed to do.
+- **Filter:** code that checks or changes a request before it reaches the controller.
+- **Filter chain:** several filters running in a set order.
+- **Security context:** the current request's user and permissions.
+- **Thread:** a worker running application code. A thread pool keeps workers ready for reuse.
+- **Bean:** an object that Spring creates and manages.
+- **Hash:** a one-way result calculated from a password. We store the result, not the password.
+- **Migration:** a numbered SQL file that changes the database structure.
+
+Start by following the path from the login request to the password check. Learn each Spring class by its job before trying to remember its name.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. Authentication vs Authorization
 
@@ -34,22 +54,17 @@ POST /api/v1/events   with a valid token of a USER
   Missing token, expired token, bad signature.
 - **403 Forbidden** — I know exactly who you are, and the answer is still no.
 
-A client can react to 401 by refreshing the token and retrying. Reacting that way to a 403 gives an
-infinite loop. So this is not pedantry — it changes client behaviour.
+A client may handle 401 by getting a new token and trying again. A 403 means the known user lacks permission, so sending the same request again will not help. The status code tells the client what to do next.
 
 ## A2. Spring Security architecture
 
-This is the section that matters most in interviews. Take it slowly.
+Take this section slowly. Follow what happens to one login request. You can then use that flow to explain the class names.
 
 ### A2.1 It is filters all the way down
 
-Spring Security is not "a library your controller calls." It is **a chain of Servlet Filters placed
-in front of your entire application**. Your controller is never reached if the chain rejects the
-request.
+Spring Security runs **filters before your controller**. Each filter has a checking or setup job. If a security check rejects the request, the controller does not run.
 
-The bridge from the servlet container into Spring is a single filter called `DelegatingFilterProxy`,
-registered under the name `springSecurityFilterChain`. The container creates it. It looks up a Spring
-bean — `FilterChainProxy` — and hands the request over.
+The web server passes the request to `DelegatingFilterProxy`, registered as `springSecurityFilterChain`. That filter finds Spring's `FilterChainProxy` object and passes the request to it. This connects the web server's filters to Spring's security filters.
 
 ```
 Tomcat
@@ -59,12 +74,9 @@ Tomcat
                     └── runs that chain's filters in order
 ```
 
-`FilterChainProxy` can hold several `SecurityFilterChain` objects and picks the **first one whose
-matcher matches**. That is how you can have one rule set for `/api/**` and another for `/actuator/**`.
+`FilterChainProxy` can hold several security rule sets, called `SecurityFilterChain` objects. It uses the **first matching one**. For example, `/api/**` can have different rules from `/actuator/**`.
 
-> **Interview definition:** "Spring Security is a chain of servlet filters injected through a
-> `DelegatingFilterProxy`. `FilterChainProxy` picks the first matching `SecurityFilterChain` and runs
-> its filters in a fixed order — the whole framework is filters plus a `ThreadLocal`."
+> **How to explain it:** "A request passes through security filters before reaching the controller. `DelegatingFilterProxy` passes it to `FilterChainProxy`, which chooses the first matching `SecurityFilterChain`. The filters check the request in order."
 
 ### A2.2 The filters you must know, in order
 
@@ -116,27 +128,19 @@ Two rules follow directly from this table:
 
 **The pieces in plain words:**
 
-- **`Authentication`** is one object used for two different things. Before: "here is a claim, please
-  check it." After: "this claim was verified, here is who it is." The `authenticated` boolean and the
-  filled-in `authorities` are what change.
-- **`AuthenticationManager`** is just an interface with a single method. Everything else is detail.
-- **`ProviderManager`** holds a list of `AuthenticationProvider`s. Each provider says whether it
-  `supports(...)` a given token type. This is how you can support password login, LDAP and API keys in
-  one app: three providers, one manager.
-- **`DaoAuthenticationProvider`** is the built-in provider for username/password. It calls your
-  `UserDetailsService`, then `PasswordEncoder.matches()`, then builds the authenticated token.
-- **`UserDetailsService`** is a one-method interface: given a username, return a `UserDetails` or
-  throw `UsernameNotFoundException`. It is **your bridge from Spring Security to your database.**
-- **`PasswordEncoder`** hashes and compares. Never compare passwords with `equals()`.
+- **`Authentication`** holds login details before the check and the verified user after it. The `authenticated` flag records whether verification succeeded; `authorities` holds permissions.
+- **`AuthenticationManager`** accepts those details and asks a provider to check them.
+- **`ProviderManager`** keeps several `AuthenticationProvider`s. It chooses a provider that can handle the supplied login type, such as passwords or API keys.
+- **`DaoAuthenticationProvider`** handles username/password login. It loads the user with `UserDetailsService`, checks the password with `PasswordEncoder.matches()`, and returns the verified user.
+- **`UserDetailsService`** loads the user from your database. If the user is missing, it throws `UsernameNotFoundException`.
+- **`PasswordEncoder`** hashes passwords and checks them. Never compare passwords with `equals()`.
 
 ### A2.4 `SecurityContextHolder` — the `ThreadLocal` that makes everything work
 
 `SecurityContextHolder` stores the current `SecurityContext` in a **`ThreadLocal`** — a variable
 whose value is private to one thread.
 
-Why that design: Spring MVC is **thread per request**. Tomcat takes a thread from its pool, runs your
-whole request on it, and returns it. So "the current user" can live in a thread-local and be readable
-from *anywhere* — service, repository, even a logger — with no plumbing.
+For the normal Spring MVC request flow used here, Tomcat assigns a thread to handle a request. Code on that thread can read the current user from `SecurityContextHolder`. That avoids passing the user object through every method. Tomcat reuses the thread after the request ends.
 
 ```java
 var auth = SecurityContextHolder.getContext().getAuthentication();
@@ -145,17 +149,10 @@ String email = auth.getName();
 
 **Two consequences you must remember:**
 
-1. **The value must be cleared at the end.** Tomcat reuses threads. If the context is not cleared,
-   the next request on that thread inherits the previous user's identity — a real, catastrophic
-   security bug. `SecurityContextHolderFilter` clears it in a `finally` block. Never write your own
-   filter that sets the context without a `finally` clear.
-2. **It does not cross threads.** Spawn a new thread, use `@Async`, or use a `CompletableFuture`, and
-   the context is empty there. Spring offers `DelegatingSecurityContextExecutor` for this. This is a
-   favourite interview trap.
+1. **Clear the value when the request ends.** Tomcat reuses threads. Leaving the old user there could make the next request appear to belong to that user. `SecurityContextHolderFilter` clears the value in a `finally` block. A custom filter that manages this context must also ensure cleanup.
+2. **A new thread does not receive it automatically.** Code using `@Async` or `CompletableFuture` may see an empty context. `DelegatingSecurityContextExecutor` can pass the context to another thread when needed.
 
-**Node.js bridge:** `SecurityContextHolder` is Java's answer to `AsyncLocalStorage` / `req.user`. In
-Express you attach the user to the request object and pass it around. In Spring the request object is
-not passed down, so the thread carries it instead.
+**If you know Node.js:** Express often keeps the user in `req.user`; `AsyncLocalStorage` can also keep request-specific values. In this Spring MVC flow, `SecurityContextHolder` keeps the user available on the request's thread.
 
 ### A2.5 Roles vs authorities, and the `ROLE_` prefix
 
@@ -178,27 +175,19 @@ convention and never mix.
 
 ### Never store a password
 
-If your database leaks — and databases leak — plain passwords mean every user is compromised, on
-your site and on every other site where they reused it.
+If someone gets a copy of your database, stored plain passwords can be read immediately. Users who reused those passwords may also lose access to accounts on other sites.
 
-**Hashing is one-way.** Encryption is two-way. Passwords must be hashed, never encrypted, because
-there must be no key that turns them back.
+**Hashing works in one direction:** it calculates a value from the password without providing a way to turn it back. **Encryption can be reversed with a key.** Store password hashes so there is no decryption key that reveals everyone's passwords.
 
 ### Why not SHA-256
 
-SHA-256 is a *fast* hash. That is exactly what makes it wrong here. A GPU computes billions of
-SHA-256 hashes per second, so an attacker with your leaked table brute-forces common passwords almost
-instantly.
+SHA-256 calculates hashes very quickly. That makes it unsuitable for storing ordinary passwords: an attacker with the database can test huge numbers of password guesses quickly.
 
-**BCrypt is deliberately slow, and you control how slow.** The cost factor (default 10 in Spring) is
-an exponent: cost 10 = 2^10 = 1024 rounds. Each +1 doubles the work. ~100 ms per hash is fine for a
-login endpoint and brutal for an attacker trying billions.
+**BCrypt deliberately makes each guess slower.** Its cost setting controls the work: cost 10 means 2^10 = 1024 rounds, and increasing the cost by 1 doubles the work. A small delay at login makes checking large numbers of stolen password guesses more expensive.
 
 ### Salt
 
-A **salt** is random data mixed into the hash so that two users with the same password get different
-hashes. Without it, an attacker precomputes a table of common-password hashes once (a rainbow table)
-and cracks every matching user at once.
+A **salt** is random data used when hashing a password. It makes two users with the same password get different stored hashes. This stops an attacker from using one prepared list of hashes to identify all matching passwords.
 
 BCrypt generates a random salt itself and stores it **inside the output string**:
 
@@ -217,9 +206,7 @@ the stored string, hashes the raw input the same way, and compares.
 
 ### Timing attacks
 
-Compare hashes with a constant-time comparison, not `equals()` — a comparison that exits early on the
-first different byte leaks information about how much of the guess was right. `PasswordEncoder`
-implementations already do this. This is one more reason never to hand-roll it.
+A comparison that stops at the first different character can reveal information through its timing. Use `PasswordEncoder` to check passwords rather than writing a comparison with `equals()`. The library handles the password-checking details.
 
 ## A4. Stateless authentication and what it costs
 
@@ -232,8 +219,7 @@ Problems in microservices:
   sessions or a shared session store (Redis).
 - The gateway cannot make an auth decision without asking a session store.
 
-**Stateless:** the server stores nothing. The client sends a **signed token** on every request. Any
-instance of any service can verify it alone, with just the signing key.
+**Stateless token authentication:** the client sends a signed token on each request. The service checks the token instead of looking up a saved login session. A verifier needs the correct verification key. We build this in Phase 2b.
 
 ```java
 http.sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATELESS));
@@ -241,19 +227,13 @@ http.sessionManagement(s -> s.sessionCreationPolicy(SessionCreationPolicy.STATEL
 
 That line tells Spring Security: never create an `HttpSession`, never read one.
 
-**The honest trade-off:** you cannot instantly revoke a stateless token. It stays valid until it
-expires, because there is nothing to delete. Fixes are short access-token lifetimes (15 minutes) plus
-refresh tokens you *do* store — exactly what we build in Phase 2b.
+**The cost:** a token already given to a client stays usable until it expires unless the server adds a check against saved revocation data. We use short-lived access tokens and stored refresh tokens in Phase 2b. Logging out stops future refreshes, but the existing access token can still work until expiry.
 
 ### CSRF, and why we disable it
 
-**CSRF (Cross-Site Request Forgery):** a malicious site makes your browser send a request to our API.
-The browser **automatically attaches cookies** — so the request arrives authenticated even though the
-user never meant to send it.
+**CSRF (Cross-Site Request Forgery)** is when another site tricks a browser into sending a request to your API. If the browser automatically includes a login cookie, the API may believe the user chose to send it.
 
-The attack depends entirely on credentials being sent *automatically*. A JWT in an
-`Authorization: Bearer` header is **not** sent automatically — the attacker's page cannot read our
-token or add that header (the browser's same-origin policy stops it).
+The important point is whether the browser sends login details automatically. In this project, application code adds the JWT in the `Authorization: Bearer` header. Another website cannot normally read our stored token and add that header on the user's behalf.
 
 So: **`Authorization` header + no cookies ⇒ CSRF protection is unnecessary.**
 
@@ -261,19 +241,15 @@ So: **`Authorization` header + no cookies ⇒ CSRF protection is unnecessary.**
 http.csrf(csrf -> csrf.disable());
 ```
 
-**But be careful about *why* you are writing that line.** If you later store the JWT in a cookie, CSRF
-comes straight back and you must re-enable it. "Disable CSRF" is not a magic fix for a 403 — it is a
-decision that depends on where the credential lives. Plenty of production incidents start with
-somebody disabling CSRF to make an error go away.
+**Understand the reason for disabling CSRF.** This project uses a token in a header rather than an automatically sent login cookie. If you later put the token in a cookie, review and enable the needed CSRF protection. Do not disable it just to remove a 403 error.
 
 ## A5. Flyway — database migrations
 
 ### Why not `ddl-auto`
 
-`spring.jpa.hibernate.ddl-auto=update` looks convenient: Hibernate reads your entities and changes
-the schema. Three reasons it is wrong beyond a toy:
+`spring.jpa.hibernate.ddl-auto=update` asks Hibernate to change tables to match the Java entities. That is convenient for experiments, but a real project needs reviewed, repeatable database changes:
 
-1. **It only adds.** Rename a column, and `update` adds a new one and leaves the old — silently.
+1. **It only adds.** Rename a column, and `update` adds a new one and leaves the old — without a clear error.
    Drop a field, and the column stays forever.
 2. **No history and no review.** Nobody can see in a PR what happened to the database.
 3. **No control over the dangerous parts.** Indexes, constraints, data backfills, and the order they
@@ -297,16 +273,13 @@ On startup Flyway:
 3. runs any newer files in version order, inside a transaction where the database supports it,
 4. records each one with a **checksum** of the file's contents.
 
-**The checksum is the important part.** Change an already-applied migration file and Flyway refuses to
-start:
+**A checksum identifies the file contents.** If you edit a migration that already ran, Flyway detects the change and refuses to start:
 
 ```
 Migration checksum mismatch for migration version 1
 ```
 
-That is a feature. Your teammate already ran V1; editing it would leave your two databases silently
-different. **The rule: applied migrations are immutable. Always add V2.** In local dev you can reset
-with `docker compose down -v`.
+This prevents two databases from having different versions of the same migration. **Do not edit a migration after it has run; add V2 instead.** For a fresh local database, you can reset with `docker compose down -v`. That reset deletes the stored Docker volumes.
 
 `V` = versioned, runs once. `R__` = repeatable, re-runs whenever its checksum changes (good for views
 and stored procedures).
@@ -349,18 +322,11 @@ and stored procedures).
 
 **Why each one:**
 
-- `starter-security` — adds the filter chain. **The moment this is on the classpath your app changes
-  behaviour**: every endpoint becomes protected and a random password is printed at startup. Run the
-  app now and `curl localhost:8081/ping` returns 401. That is auto-configuration being helpful and
-  surprising at the same time.
-- `starter-data-jpa` — Hibernate, `EntityManager`, `JpaRepository`, and the HikariCP connection pool.
-- `starter-validation` — the Jakarta Bean Validation annotations (`@Email`, `@NotBlank`, `@Size`) plus
-  the validator that runs them. **It is not included in `starter-web`** — forget it and `@Valid` will
-  silently do nothing, which is a nasty bug to find.
-- `flyway-core` + `flyway-database-postgresql` — since Flyway 10 the Postgres support is a separate
-  artifact. Miss it and you get "Unsupported Database: PostgreSQL".
-- `postgresql` at `runtime` scope — the JDBC driver is loaded by name at runtime, never imported in
-  your code, so it does not belong on the compile classpath.
+- `starter-security` adds the security filters. Adding it protects endpoints by default and prints a generated password at startup. Run the application now and `curl localhost:8081/ping` returns 401. Later configuration replaces these defaults.
+- `starter-data-jpa` adds Hibernate, `EntityManager`, `JpaRepository`, and HikariCP for managing reusable database connections.
+- `starter-validation` adds checks such as `@Email`, `@NotBlank`, and `@Size`. It is separate from `starter-web`, so include it for request validation with `@Valid`.
+- `flyway-core` and `flyway-database-postgresql` supply migration support and its Postgres-specific part. Missing the latter can cause "Unsupported Database: PostgreSQL".
+- `postgresql` uses `runtime` scope because the application needs the database driver when running, rather than importing driver classes in the source code.
 
 ## Step 2 — Database connection
 
@@ -392,21 +358,11 @@ and stored procedures).
 
 **The four settings worth explaining properly:**
 
-`ddl-auto: validate` — Hibernate does **not** touch the schema. It only compares your entities against
-the real tables at startup and fails fast if they disagree. Flyway owns the schema; Hibernate checks
-it. That is the correct division of labour.
+`ddl-auto: validate` tells Hibernate to compare the Java entities with the existing tables at startup. It does not change the tables. Flyway makes the database changes; Hibernate checks that the code matches them.
 
-`open-in-view: false` — this one is important. The default is `true`, which keeps the Hibernate
-session open until the **HTTP response is written**. That sounds helpful (lazy loading works in the
-controller) but it means a database connection is held for the entire request, including JSON
-serialisation. Under load your connection pool empties and everything stalls. Spring Boot even logs a
-warning about it. Turning it off forces you to load what you need inside the service layer, with a
-transaction boundary you chose deliberately. You will hit `LazyInitializationException` at some point
-— that is the setting doing its job, telling you the boundary is wrong.
+`open-in-view: false` ends access to the Hibernate session at the chosen service transaction boundary instead of keeping it available while writing the HTTP response. Load the fields the response needs inside the service. Otherwise accessing an unloaded relationship later can cause `LazyInitializationException`. This setting helps avoid unexpected database queries from controllers or JSON conversion.
 
-`maximum-pool-size: 10` — each service instance holds up to 10 database connections. Postgres defaults
-to 100 total. 3 services × 3 instances × 10 = 90. That arithmetic is a real production limit; do
-it before you scale.
+`maximum-pool-size: 10` allows each running service instance up to 10 database connections. If Postgres allows 100 total, 3 services with 3 instances each could use 3 × 3 × 10 = 90. Plan this total before adding instances.
 
 `baseline-on-migrate: true` — allows Flyway to start against a database that already has objects. Safe
 here; think twice on a legacy database.
@@ -438,21 +394,12 @@ CREATE TABLE user_roles (
 
 **Design decisions in these 20 lines:**
 
-- `password_hash VARCHAR(60)` — a BCrypt string is always exactly 60 characters. Sizing the column to
-  the real value documents the format. (If you ever move to Argon2, that needs a bigger column — and
-  a migration, which is the point.)
-- `CONSTRAINT uk_users_email UNIQUE` — the **database** enforces uniqueness. Your service will also
-  check before inserting, but that check is not enough: two simultaneous registrations can both pass
-  the check and both insert. Only the unique index actually prevents it. This is your first race
-  condition, and the pattern — *check in code for a nice error, constrain in the database for
-  correctness* — repeats through the whole project.
-- `TIMESTAMPTZ` not `TIMESTAMP` — stores the time zone offset. Servers in different regions with
-  naive timestamps is a bug that surfaces months later.
-- A separate `user_roles` table rather than a `role` column: one user can hold several roles.
-- `ON DELETE CASCADE` — delete a user, their roles go too. No orphans.
-- Roles stored as `VARCHAR`, not a Postgres `ENUM` type. Adding a value to a Postgres enum needs a DDL
-  migration and locks; a varchar plus a Java enum gives you type safety where you need it and freedom
-  where you do not.
+- `password_hash VARCHAR(60)` fits the 60-character BCrypt format. Changing to an algorithm such as Argon2 needs a larger column and a migration.
+- `CONSTRAINT uk_users_email UNIQUE` stops duplicate emails in the database. Two registration requests can both pass a Java existence check before either inserts. The database rule lets only one insert succeed. The Java check gives a friendly message; the database protects the data.
+- `TIMESTAMPTZ` records an instant correctly across time zones. It does not preserve the original time-zone name or offset; a plain `TIMESTAMP` has no zone information.
+- `user_roles` is separate because one user can have several roles.
+- `ON DELETE CASCADE` removes the user's role rows when the user is deleted, so they are not left behind.
+- A `VARCHAR` role column and Java enum let the application define allowed names without using a Postgres `ENUM` type. A database enum has its own migration requirements when values change.
 
 ## Step 4 — The Role enum
 
@@ -471,10 +418,7 @@ public enum Role {
 }
 ```
 
-Small class, one real decision: the `ROLE_` prefix lives **here and nowhere else**. The database
-stores `ADMIN`, the enum stores `ADMIN`, and the only place the Spring Security prefix is added is
-this one method. When you later wonder "do I write `hasRole` or `hasAuthority`?", this method is the
-answer you can point at.
+Add the `ROLE_` prefix in this one method. The database and enum keep `ADMIN`; Spring Security receives `ROLE_ADMIN`. Keeping that conversion in one place avoids mixing `hasRole` and `hasAuthority` conventions.
 
 ## Step 5 — The User entity
 
@@ -527,20 +471,13 @@ public class User {
 
 **The choices that are not obvious:**
 
-`GenerationType.IDENTITY` maps to Postgres `BIGSERIAL`. Note the cost: with IDENTITY, Hibernate
-**cannot batch inserts**, because it must ask the database for each generated id immediately. For
-high-volume inserts `SEQUENCE` with an allocation size is faster. For a users table, IDENTITY is
-right and simpler.
+`GenerationType.IDENTITY` uses the id generated by Postgres `BIGSERIAL`. Hibernate must retrieve an id for each insert, which limits insert batching. `SEQUENCE` can be better for many inserts, but IDENTITY is a simple choice for this users table.
 
 `@ElementCollection` instead of `@OneToMany`: roles are **values**, not entities. `ADMIN` has no
 identity of its own and no lifecycle. Modelling it as an entity would add a table, a repository and a
 class for nothing.
 
-`fetch = FetchType.EAGER` here — normally eager fetching is a mistake. Here it is deliberate: we need
-the roles every single time we load a user (to build the authorities), and with `open-in-view: false`
-a lazy collection would blow up with `LazyInitializationException` outside the transaction. Small,
-always-needed collection ⇒ eager is correct. Be able to defend that sentence; a good interviewer will
-push on it.
+`fetch = FetchType.EAGER` loads roles with the user. We choose it here because login always needs the roles and the collection is small. Otherwise, with `open-in-view: false`, trying to load roles after the transaction ends could cause `LazyInitializationException`. Do not apply eager loading to every relationship without checking the need.
 
 `protected User()` — JPA **requires** a no-argument constructor to build objects by reflection.
 `protected` means JPA can use it while your own code cannot accidentally create a half-built user.
@@ -567,9 +504,7 @@ push on it.
     }
 ```
 
-Notice there are **no setters**. The only public constructor demands everything a valid user needs, so
-an invalid `User` cannot exist. Changes happen through named methods that say what they mean. That is
-the practical core of DDD: the object protects its own rules instead of trusting every caller.
+**There are no public setters.** The constructor asks for the information a valid user needs, and named methods handle changes. This keeps the object's rules together rather than asking every caller to remember them.
 
 `EnumSet.of(Role.USER)` in the constructor encodes the business rule *every new user is a USER*. It is
 in the domain object, not scattered in a service.
@@ -598,10 +533,7 @@ public interface UserRepository extends JpaRepository<User, Long> {
 }
 ```
 
-An interface with no implementation. At startup Spring Data creates a proxy class, parses each method
-**name**, and generates the query: `findByEmail` becomes
-`select u from User u where u.email = ?1`. `existsBy...` becomes a `select count(*)` that returns a
-boolean.
+You write the repository interface; Spring Data creates its implementation. It reads method names such as `findByEmail` and generates a query like `select u from User u where u.email = ?1`. An `existsBy...` method checks whether a matching record exists and returns a boolean.
 
 `Optional<User>` rather than `User`: the return type makes "there may be no such user" impossible to
 ignore. In Node you would return `null` and hope the caller checks.
@@ -700,20 +632,11 @@ password login is framework code you never touch.
 
 **Details that matter:**
 
-- **Constructor injection**, not `@Autowired` on a field. The dependency is `final`, so the object
-  cannot exist half-built, and a plain `new CustomUserDetailsService(mockRepo)` works in a unit test
-  with no Spring at all. Field injection makes both of those impossible.
-- **The parameter is called `email` although the interface says "username".** Spring Security's
-  "username" means "the unique thing a user types." Ours is an email. Naming the parameter honestly is
-  worth more than matching the interface's vocabulary.
-- **`"User not found"` — deliberately vague.** Never return "no such email" or "wrong password" as
-  separate messages. That difference lets an attacker enumerate which emails are registered. One
-  generic message for both cases.
-- **`@Transactional(readOnly = true)`** — needed because `roles` is a collection on the entity; it
-  also lets the database skip some write bookkeeping.
-- Two different classes named `User` collide here, so the Spring one is written fully qualified. In a
-  real codebase you would rename your entity or use a mapper. Left visible on purpose so you notice
-  it.
+- **Pass dependencies through the constructor.** A `final` repository field is supplied when the object is created. A test can call `new CustomUserDetailsService(mockRepo)` without starting Spring.
+- **Use the parameter name `email`.** Spring calls the login identifier a username, but our users type an email.
+- **Keep login errors general.** `"User not found"` must not tell callers whether the email or password was wrong. Different messages would help someone discover registered accounts.
+- **`@Transactional(readOnly = true)`** keeps a transaction around reading the user and roles and tells the framework this work is read-only.
+- **There are two `User` classes.** Use the full Spring class name here to distinguish it from our entity. A separate mapping class or different entity name is another way to avoid that naming conflict.
 
 ## Step 9 — SecurityConfig
 
@@ -824,10 +747,10 @@ public record RegisterRequest(
    promote themselves. This is *mass assignment*, and it is a real vulnerability class.
 3. **Your API contract stops leaking your database.** Rename a column without breaking every client.
 
-`record` fits perfectly: immutable, no boilerplate, and Jackson deserialises it through the canonical
+`record` fits perfectly: fixed after creation, no boilerplate, and Jackson deserialises it through the standard
 constructor. `record` for DTOs, `class` for entities (JPA needs mutability and a no-arg constructor).
 
-`max = 72` on the password is not arbitrary: **BCrypt silently truncates input beyond 72 bytes.** A
+`max = 72` on the password is not arbitrary: **BCrypt without a clear error truncates input beyond 72 bytes.** A
 user with a 100-character passphrase would have the last 28 ignored. Rejecting is honest.
 
 **File:** `.../api/dto/UserResponse.java`
@@ -940,7 +863,7 @@ public class AuthService {
 Normalise **once, at the edge of the system**, so the rest of the code can assume it.
 
 `existsByEmail` check — gives a clean 409 instead of a raw constraint violation. It does **not**
-guarantee correctness: two concurrent registrations can both pass this check. The unique index in V1 is
+guarantee correctness: two happening at the same time registrations can both pass this check. The unique index in V1 is
 what actually prevents the duplicate; one request then fails with a `DataIntegrityViolationException`.
 Ugly but safe. *Check for the message, constrain for the truth.* Remember this pattern — Phase 8 is
 built on it.
@@ -1313,7 +1236,7 @@ FlywayValidateException: Migration checksum mismatch for migration version 1
 ```
 
 The app refuses to start. **This is correct behaviour**, and one day it will save you from a
-production database that silently differs from staging. Undo the edit and it starts again.
+production database that without a clear error differs from staging. Undo the edit and it starts again.
 
 ### Drill 3 — kill the database
 
@@ -1355,32 +1278,27 @@ worth calling out.
 |---|---|---|
 | `anyRequest().authenticated()` placed first | Public endpoints return 401 | First match wins — order matters |
 | Forgot `@Valid` | Invalid data reaches the database | Add it on the `@RequestBody` |
-| Forgot `starter-validation` | `@Valid` silently does nothing | Add the dependency |
+| Forgot `starter-validation` | `@Valid` without a clear error does nothing | Add the dependency |
 | Returning the entity from the controller | `passwordHash` in the JSON response | Always a response DTO |
 | Different messages for unknown email vs wrong password | User enumeration | One generic message |
 | Two `UserDetailsService` beans | Confusing auth failures | Exactly one |
 | `PasswordEncoder` declared in `SecurityConfig` | Circular dependency at startup | Separate config class |
 | Editing an applied migration | App refuses to start | Add V2; never edit V1 |
 | `ddl-auto: update` with Flyway | Two things fighting over the schema | `validate` |
-| `open-in-view` left `true` | Pool exhaustion under load | Set it `false` |
+| `open-in-view` left `true` | Pool running out under load | Set it `false` |
 | Logging the raw password or the request body | Passwords in your log files | Log ids, mask emails |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Rate limit login.** Without it, BCrypt cost 12 is a denial-of-service vector: an attacker sends
-  thousands of login attempts and your CPU burns on hashing. Also lock an account after N failures.
-- **`DelegatingPasswordEncoder`** so the algorithm can be upgraded later without a forced reset.
-- **Password policy** beyond a length check: reject known-breached passwords (the Have I Been Pwned
-  k-anonymity API is the standard approach).
-- **Audit log** for registration, login success, login failure and role changes — a separate table,
-  not just application logs.
-- **Never log tokens, passwords, or full emails.**
-- **Email verification** before the account becomes usable. Our `enabled` flag is already the hook for
-  it.
-- **Secrets from environment variables**, never from `application.yml` in Git. Phase 3 covers this
-  when the JWT signing key appears — a key in a committed file is a real breach.
+- **Limit login attempts.** BCrypt deliberately uses CPU time. Too many attempts can overload the server, so use rate limits and a suitable account-locking policy after repeated failures.
+- **Use `DelegatingPasswordEncoder`** if you need to support a later password-hash upgrade without resetting all passwords.
+- **Check password quality**, not only length. A breached-password service such as Have I Been Pwned can check known leaked passwords without sending the full password.
+- **Keep an audit table** for registration, login success, login failure, and role changes. An audit log is a lasting record of security actions.
+- **Never log passwords, tokens, or full email addresses.**
+- **Verify email ownership** before enabling an account. The `enabled` flag can support that flow.
+- **Read real secrets from environment variables**, rather than committing them in `application.yml`. Someone with a JWT signing key can create valid tokens.
 
 ---
 

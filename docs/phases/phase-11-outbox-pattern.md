@@ -4,16 +4,37 @@
 **Needs:** Phase 10b finished.
 **Pre-reading:** the dual-write problem — why a database commit and a message send cannot be atomic.
 
-Phase 10b Drill 6: the API returned 200, the event was cancelled, the message was lost, and bookings for
-a cancelled event stayed `CONFIRMED` forever. This phase fixes that class of bug permanently.
+Phase 10b showed that an event cancellation could be saved while its message was lost. Booking-service then never learned about it. This phase saves the message with the database change so it can still be sent after a restart.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase stops a saved business change from losing its message when the application crashes. It saves the message to an outbox table before a background job sends it to Kafka.
+
+Example: cancelling an event must also tell booking-service. Save both the cancellation and a message-to-send in one local transaction. Either both are saved or neither is. If Kafka is down, the saved message waits in the outbox and can be sent later.
+
+Words used in this phase:
+
+- **Dual write:** updating two separate systems, such as Postgres and Kafka, for one action.
+- **Atomic:** changes succeed together or are rolled back together within the protected operation.
+- **Outbox:** a table in the service's own database holding messages that need sending.
+- **Publisher / relay:** the background work that sends saved outbox messages to Kafka.
+- **Polling:** checking regularly for work to do.
+- **CDC (Change Data Capture):** reading database changes from its log instead of repeatedly querying a table.
+- **Backlog:** work saved but not yet completed.
+- **Partial index:** an index containing only rows matching a condition, such as unpublished messages.
+- **At-least-once:** a message can be sent again after an uncertain result. Consumers must handle duplicates.
+
+Start with A1: compare a crash after the database save with a crash before the Kafka send. Then see why storing the message alongside the change closes that gap.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. The dual-write problem
 
-Any time one operation must change **two systems**, you have this problem.
+**One user action sometimes needs two separate writes.** For example, save an event change in Postgres and send a notification to Kafka. Without a shared transaction, one can succeed while the other fails.
 
 ```java
 @Transactional
@@ -40,32 +61,26 @@ public void cancel(Long id) {
    → send() "succeeded" from your code's point of view.  Message gone.
 ```
 
-**Case 3 is the one that proves you cannot fix this with error handling.** There is no `catch` for the
-process being killed. A `try/finally`, a retry loop, a shutdown hook — none of them run when the
-container is terminated, the machine loses power, or the JVM is OOM-killed.
+**A crash can happen between the two writes.** An ordinary `catch`, retry loop, or `finally` block cannot guarantee recovery after the process has been killed or the machine loses power. The missing work needs a saved record.
 
-**The root cause: two systems, two commits, no shared transaction.**
+**The cause:** the database and Kafka save independently. One successful save does not guarantee the other happened.
 
 ## A2. Why not a distributed transaction
 
-Two-phase commit (XA) exists: a coordinator asks every participant to prepare, then tells them all to
-commit.
+**Two-phase commit (XA)** uses a coordinator. It first asks all participants to prepare their changes, then tells them to commit. This needs support from every participating system.
 
-Nobody uses it for this, for good reasons:
+We do not use it here because:
 
-- **Kafka does not support XA.** Neither do most modern message brokers or HTTP APIs.
-- **It blocks.** Participants hold locks through both phases. Throughput collapses.
-- **The coordinator is a single point of failure.** If it dies between prepare and commit, participants
-  are stuck holding locks, waiting — the "in-doubt" state.
-- **It does not scale**, which is why the entire microservices industry moved to eventual consistency
-  instead.
+- **Kafka does not participate in XA transactions**, and ordinary HTTP APIs do not join them either.
+- **Participants can hold locks while waiting**, reducing how much work they can complete.
+- **A coordinator failure can leave work waiting for a decision** about whether to commit or roll back.
+- **It adds coordination across systems.** This project instead saves local work first and lets services agree through messages.
 
-**The modern answer: never do two writes. Do one write, then derive the second from it.**
+**Our solution:** save the business change and the message together in one database, then send that saved message separately.
 
 ## A3. The outbox
 
-**Write the event into your own database, in the same transaction as the business change.** One
-database, one transaction, atomic by definition.
+**Add an outbox row in the same transaction as the business change.** Both records are in the service's database. If that transaction fails, neither is saved; if it commits, both are saved.
 
 ```
 ONE TRANSACTION
@@ -79,55 +94,40 @@ SEPARATELY, later
            → UPDATE outbox_events SET published_at = NOW()
 ```
 
-**Why this is watertight:**
+**Why this survives failures:**
 
-- The business change and the intent to publish **commit together**. Impossible to have one without the
-  other.
-- If the process dies before publishing, the row is still there. The next poll picks it up.
-- If Kafka is down for an hour, rows accumulate and are published when it returns.
-- If the publish succeeds but marking it fails, the message is sent **twice** — at-least-once, which
-  Phase 9 already made safe.
+- **The change and message-to-send commit together.** One cannot be committed without the other by this transaction.
+- **A restart does not erase a committed outbox row.** The publisher can find it later.
+- **If Kafka is down, messages wait in the table.** They can be sent when Kafka recovers.
+- **A message may be sent twice** if sending succeeds but marking it as published fails. Consumers therefore still need duplicate checks.
 
-**The guarantee is at-least-once, never exactly-once.** That is not a weakness to apologise for; it is
-the correct target, because exactly-once delivery is impossible (Phase 9, concept A3). At-least-once
-delivery plus an idempotent consumer is effectively exactly-once processing.
+**Expect at-least-once sending.** The publisher may repeat a send after an uncertain result. A consumer must save its processed-message id and business changes together to prevent repeated database effects.
 
-> **Interview definition:** "The outbox turns a dual write into a single write. The event is stored in
-> the same transaction as the state change, and a separate process publishes it. You trade immediate
-> delivery for guaranteed delivery, and you accept duplicates — which is fine because consumers are
-> idempotent."
+> **How to explain it:** "Save the message and business change in one local database transaction. A background publisher sends the message later. Crashes can delay it, and retries can duplicate it, so consumers must recognise duplicates."
 
 ## A4. Two ways to get rows out of the table
 
 ### Polling publisher — what we build
 
-A scheduled job queries unpublished rows and sends them.
+A scheduled job looks for rows not yet published and sends their messages. This is called a **polling publisher**.
 
-**Good:** simple, no extra infrastructure, works with any database, easy to debug and to test.
-**Costs:** polling latency (100 ms–1 s), constant queries against the table, and you must handle
-multiple instances polling at once.
+**Benefits:** simple application code, no extra platform, and easy local testing.
+**Costs:** messages wait until the next check, the job regularly queries the database, and multiple application instances need to divide the work safely.
 
 ### Change Data Capture (CDC) — Debezium
 
-A connector reads the database's **write-ahead log** (Postgres logical replication) and streams changes
-to Kafka directly.
+**CDC** reads the database's own change log and sends those changes to Kafka. Debezium is a tool for this. Postgres uses a write-ahead log to record changes; a connector reads the relevant changes from it.
 
-**Good:** no polling load, very low latency, no application code at all.
-**Costs:** Debezium and Kafka Connect to run and operate, replication slots to manage (a stalled slot
-fills your disk and takes the database down), and a much steeper learning curve.
+**Benefits:** fewer polling queries and quick delivery of changes.
+**Costs:** more tools to run, including Debezium and Kafka Connect. You must also monitor replication slots: if the connector stops reading, retained database log data can fill the disk.
 
-**Choose polling until the load justifies CDC.** At a few thousand events per second, polling is fine.
-**Being able to explain both, and why you picked one, is what an interview is looking for** — not having
-used Debezium.
+**We build polling because it is easier to learn and operate here.** Consider CDC when measured polling load or delay justifies the extra tools. Understand the benefits and costs of both approaches.
 
 ## A5. Ordering, and being honest about it
 
-The outbox can preserve ordering **per aggregate** if you publish in `id` order and key by aggregate id.
-Global ordering across aggregates is neither preserved nor needed (Phase 10a: ordering is per
-partition anyway).
+**Related messages need the right order.** Publish outbox rows in `id` order and use the aggregate id as the Kafka key. When several publishers run, the locking and batch strategy must also preserve the required order. Different aggregates do not need one global order.
 
-**The subtle failure:** publish rows 1, 2, 3 in a batch; row 2's send fails; rows 1 and 3 are already
-gone. Retrying row 2 sends it **after** row 3.
+**Watch a partial batch failure.** If rows 1 and 3 are sent but row 2 fails, retrying row 2 later puts it after row 3. Sorting the original batch alone does not prevent this.
 
 **Two honest options:**
 
@@ -135,8 +135,7 @@ gone. Retrying row 2 sends it **after** row 3.
    the same aggregate — which is usually what you want, since they are causally related.
 2. **Accept it** and make consumers order-tolerant (checking a version or timestamp in the payload).
 
-**Our choice: option 1, per aggregate.** If `EventUpdated` cannot be published, `EventCancelled` for the
-same event must wait. Publishing them out of order would be worse than publishing them late.
+**We choose to stop later messages for the same aggregate after a failure.** For example, do not send `EventCancelled` ahead of an earlier failed `EventUpdated` for that event. Delay is preferable to the wrong order.
 
 ## A6. Multiple instances
 
@@ -148,7 +147,7 @@ instance B: SELECT unpublished → rows 1,2,3     ← the same rows
 → every event published three times
 ```
 
-Duplicates are survivable, but three times the traffic for nothing is not. The fix is one line of SQL:
+Repeated sends can be handled by duplicate checks, but we should avoid several publishers doing the same work unnecessarily. Use row locking to divide the work:
 
 ```sql
 SELECT * FROM outbox_events
@@ -158,12 +157,9 @@ SELECT * FROM outbox_events
  FOR UPDATE SKIP LOCKED;
 ```
 
-**`FOR UPDATE SKIP LOCKED` is the one to remember.** Instance A locks rows 1–50; instance B **skips
-them** rather than blocking and takes 51–100. Every instance works in parallel on a different slice,
-with no coordination, no distributed lock, and no leader election.
+**`FOR UPDATE SKIP LOCKED` lets workers take different rows.** If A locks rows 1–50, B skips them and takes other unlocked rows. The database coordinates the workers, so they do not need a separate Redis lock or a chosen leader.
 
-Postgres, MySQL 8+ and Oracle all support it. **This is the standard way to build a work queue in a
-relational database**, and it comes up often in interviews.
+This SQL feature is available in Postgres, MySQL 8+, and Oracle. It is useful when several workers take jobs from a database table.
 
 ---
 
@@ -211,19 +207,15 @@ backlog, typically a handful of rows, not the millions you have published over t
 polling query stays microsecond-fast forever, and the index barely uses memory.
 
 **Without it, the poller gets slower every day** and eventually becomes the reason the service falls
-over. A genuinely excellent thing to mention in an interview.
+over. A really excellent thing to mention in an interview.
 
 **The other columns:**
 
-- `aggregate_type` / `aggregate_id` — what this event is about. `aggregate_id` becomes the **Kafka
-  message key** (Phase 10a), so it decides the partition and therefore the ordering.
-- `message_id` with `UNIQUE` — generated here, at write time, and carried through to the consumer's
-  `processed_messages`. **Generated once, so a republished row keeps the same id and dedup works.**
-- `payload TEXT` — the serialised envelope, frozen at the moment of the change. Rebuilding it later from
-  the entity would capture a *different, newer* state. **The event must describe what happened, not what
-  is currently true.**
-- `attempts`, `last_error`, `next_attempt_at` — retry state, so one broken row does not spin forever.
-- `topic` per row, so one table serves every topic this service publishes to.
+- `aggregate_type` and `aggregate_id` identify the object the event concerns. `aggregate_id` supplies the Kafka key, which chooses the partition.
+- `message_id` has a `UNIQUE` constraint. Generate it once when saving the outbox row, and keep it unchanged for every resend. The consumer records it in `processed_messages`.
+- `payload TEXT` stores the complete envelope as it was at the time of the change. Rebuilding it later from the entity could accidentally describe newer data.
+- `attempts`, `last_error`, and `next_attempt_at` record retry progress, the last failure, and when the row may be tried again.
+- `topic` records the destination, allowing one service's outbox table to hold messages for several topics.
 
 ## Step 2 — Entity
 
@@ -316,15 +308,9 @@ public class OutboxEvent {
 
 (Add getters.)
 
-**`messageId` is generated in the constructor**, at business-transaction time — not at publish time.
-That is deliberate: if publishing fails and the row is retried, the message id is **the same**, so the
-consumer's dedup recognises the duplicate. Generating it at publish time would give every retry a new
-identity and defeat Phase 9 entirely.
+**Create `messageId` when constructing the outbox row.** A retry must keep the same id, so the consumer can recognise a message it has already handled. Generating a fresh id every time it is sent would bypass the duplicate check.
 
-**`markFailed` implements exponential backoff capped at 5 minutes**, stored in the row rather than held
-in memory. A broken row is retried at 2 s, 4 s, 8 s … 300 s, and **the backoff survives a restart**
-because it is state, not a variable. A row that fails permanently stops consuming the poller's attention
-almost immediately.
+**`markFailed` saves the retry delay in the row.** The delays increase from 2 seconds to 4, 8, and up to 300 seconds, or 5 minutes. Because `next_attempt_at` is in the database, a restart does not erase the waiting schedule. A failing row is not retried on every poll.
 
 **Truncating `lastError` at 2000 characters** — a full stack trace can be tens of kilobytes, and a table
 of them will surprise you.
@@ -378,9 +364,7 @@ SELECT ... FOR UPDATE SKIP LOCKED
 
 Concept A6 — every instance takes a different slice with no coordination.
 
-**Turn on `logging.level.org.hibernate.SQL: DEBUG` and confirm `skip locked` appears in the generated
-SQL.** If it does not, every instance will publish every row, and you will not notice until you scale
-to two instances in production.
+**Verify the generated SQL.** Enable `logging.level.org.hibernate.SQL: DEBUG` and check for `skip locked`. Without the intended locking, multiple publishers may take the same work or block each other. Test with more than one instance before relying on the behaviour.
 
 `order by o.id asc` gives oldest-first publishing, preserving insertion order (concept A5).
 
@@ -439,9 +423,7 @@ public class OutboxWriter {
 It **joins the caller's transaction**. `EventService.cancel()` is `@Transactional`, so the `UPDATE
 events` and this `INSERT INTO outbox_events` commit together, or neither does.
 
-**Adding `@Transactional(REQUIRES_NEW)` here would destroy the pattern** — the outbox row would commit
-independently and you would be back to a dual write, just with extra steps. **This is the mistake to
-watch for**, because `REQUIRES_NEW` looks careful and is exactly wrong here.
+**Do not add `@Transactional(REQUIRES_NEW)` here.** A separate outbox transaction could commit while the business transaction fails, or fail after the business transaction commits. Both records must use the same transaction for the outbox pattern to work.
 
 The envelope is built with **the row's own `messageId`** so the id in the message and the id in the
 table are the same value — which is what makes republishing safe.
@@ -563,15 +545,9 @@ public class OutboxPublisher {
 
 **Five decisions in this method, each worth understanding:**
 
-**`fixedDelay = 500`** — half a second between the *end* of one run and the start of the next.
-`fixedRate` would start runs on a timer and overlap them if one ran long. Publishing latency is
-therefore up to ~500 ms, which is the cost of polling (concept A4). Lower it for tighter latency, at the
-cost of more queries.
+**`fixedDelay = 500` waits half a second after one run finishes before starting the next.** `fixedRate` schedules starts at regular intervals instead; whether work can overlap also depends on the scheduler setup. Polling adds delivery delay. Shorter delays reduce that wait but create more database queries.
 
-**`.get(5, TimeUnit.SECONDS)` — blocking on purpose, and this is the one exception to the rule.** Phase
-10b said never block on `send()`. Here we must: **we have to know whether it succeeded before marking
-the row published.** This runs on a scheduler thread, not a request thread, so blocking costs nobody
-anything. **Knowing when a rule does not apply is more useful than the rule.**
+**Wait for Kafka's result here before marking the row published.** `.get(5, TimeUnit.SECONDS)` limits that wait to 5 seconds. This happens on a background scheduler thread, not a user request thread. It still uses a worker and can hold a transaction or lock, so keep the timeout and batch size controlled.
 
 **`blockedAggregates`** implements concept A5. If `EventUpdated` for event 7 fails, we skip every later
 row for event 7 in this batch so ordering is preserved. Other aggregates continue unaffected.
@@ -582,7 +558,7 @@ and dirty checking writes them at commit (Phase 4, Drill 5).
 **Failures do not abort the batch.** One bad row must not stop 49 good ones. Each row succeeds or fails
 on its own.
 
-**Exhausted rows keep being polled** with a 5-minute backoff. In production, move them to a
+**Used up rows keep being polled** with a 5-minute backoff. In production, move them to a
 `outbox_events_failed` table or alert loudly — a row that has failed ten times needs a human, not a
 retry.
 
@@ -610,13 +586,9 @@ Add `@EnableScheduling` to the main class.
 }
 ```
 
-**Keep published rows for seven days**, not zero. They are an audit trail: "did we publish that event,
-and when?" is a question you will be asked during an incident, and the row answers it exactly.
+**Keep published rows for seven days in this example.** They record what was sent and when, which helps investigate failures. The cleanup job later removes old published rows.
 
-**The backlog is the metric that matters.** Normally 0–5. A steadily rising backlog means Kafka is down,
-the poller has stopped, or something is failing repeatedly — and it is a leading indicator, visible
-*before* users notice anything. In production this is a gauge in Prometheus with an alert, not a log
-line.
+**Watch the outbox backlog:** rows waiting to be published. A growing backlog can mean Kafka is unavailable, the publisher stopped, or messages keep failing. Measure both the count and the age of the oldest row, and alert when work is stuck.
 
 ## Step 8 — Run it
 
@@ -661,9 +633,7 @@ docker exec -it ebp-postgres psql -U ebp -d event_db -c \
 
 Zero. **The event was delivered, minutes late, with nothing lost.**
 
-**Compare directly with Phase 10b Drill 6**, which is the same scenario: there, the message vanished and
-bookings for a cancelled event stayed `CONFIRMED` forever. Same failure, opposite outcome. **That
-difference is the entire value of this phase.**
+**Compare this with Phase 10b Drill 6.** There, the cancellation message could disappear. Here, the committed outbox row remains available for a later send. The user-visible change may be delayed, but the work to notify booking-service is saved.
 
 ### Drill 2 — kill the process mid-flight
 
@@ -731,9 +701,9 @@ docker exec -it ebp-postgres psql -U ebp -d event_db -c \
 ```
 
 Watch `attempts` climb and `next_attempt_at` stretch to five minutes. The row never blocks other
-aggregates, and the log shows the exhaustion message after ten attempts.
+aggregates, and the log shows the running out message after ten attempts.
 
-**Then decide what should happen next.** Retrying a malformed payload forever is pointless; it needs a
+**Then decide what should happen next.** Retrying a incorrectly formatted payload forever is pointless; it needs a
 `FAILED` state and an alert, exactly like Phase 10b's DLT. **The outbox needs its own dead-letter
 thinking** — that is the natural next improvement to this code.
 
@@ -758,21 +728,15 @@ thinking** — that is the natural next improvement to this code.
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Alert on backlog and on age of the oldest unpublished row.** Age matters more than count: one row
-  stuck for an hour is worse than a hundred rows from ten seconds ago.
-- **A dead-letter state** for exhausted rows, plus an admin endpoint to inspect and replay them.
-- **Consider CDC (Debezium)** if polling load or latency becomes a problem — and be able to explain the
-  operational cost you would be taking on.
-- **The outbox table is hot.** It is written on every business transaction and polled constantly. Watch
-  for bloat and ensure autovacuum keeps up.
-- **Batch size is a tuning knob** — larger batches are more efficient and hold locks longer.
-- **One outbox table per service**, never shared. It is part of that service's database.
-- **The inbox pattern** is the mirror image: record incoming message ids in a table (Phase 9's
-  `processed_messages`) so consumers are idempotent. Outbox guarantees *sending*; inbox guarantees
-  *processing once*. **Together they give end-to-end exactly-once processing** — and that sentence is a
-  complete answer to one of the hardest interview questions in this space.
+- **Alert on pending row count and age.** One message stuck for an hour may matter more than many newly queued messages.
+- **Keep failed rows inspectable.** After the retry limit, record a failed state and provide a controlled way to inspect and replay the work.
+- **Consider CDC with Debezium** if measured polling load or delay becomes a problem. It also adds tools and database-log management.
+- **Maintain the outbox table.** It gets frequent inserts and scans. Monitor table growth and Postgres autovacuum, the background cleanup of old row versions.
+- **Tune batch size.** Larger batches reduce overhead but can hold locks longer.
+- **Keep one outbox per service database.** Do not share one table across service boundaries.
+- **Use the inbox-style duplicate check too.** Phase 9's `processed_messages` records incoming work completed in the same transaction as the business change. The outbox preserves outgoing work; this check prevents repeated local effects. Together they support reliable sending and once-only database effects, provided those transaction rules are followed.
 
 ---
 
@@ -796,7 +760,7 @@ thinking** — that is the natural next improvement to this code.
 ## What Phase 12 does next
 
 Delivery is now guaranteed. The booking flow, however, is still the synchronous design from Phase 6 —
-reserve over HTTP, then insert, with a hand-rolled compensation in a `catch` block that does not run if
+reserve over HTTP, then insert, with a written by hand compensation in a `catch` block that does not run if
 the process dies.
 
 Next: the **Saga**. Booking created as `PENDING` with an outbox row, event-service reserves seats and
@@ -804,5 +768,5 @@ replies with `SeatsReserved` or `SeatsRejected`, booking-service confirms or rej
 becomes a durable message rather than a `catch` block. Choreography versus orchestration, and how to
 debug a flow that spans two services and several seconds.
 
-**Pre-reading for Phase 12:** the CAP theorem in plain terms, and what "eventual consistency" means to a
+**Pre-reading for Phase 12:** the CAP theorem in simple words, and what "eventual consistency" means to a
 user.

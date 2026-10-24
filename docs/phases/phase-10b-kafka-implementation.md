@@ -3,17 +3,36 @@
 **Time:** 4–5 hours
 **Needs:** Phase 10a (concepts + topics created).
 
-We start with genuinely one-way events — `EventCreated`, `EventUpdated`, `EventCancelled` — so the
-plumbing is learned before Phase 12 makes the booking flow depend on it.
+We begin with notifications: `EventCreated`, `EventUpdated`, and `EventCancelled`. First learn to send and read messages. Phase 12 then uses them to decide booking outcomes.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase connects your Java services to Kafka. Event-service sends messages when events change, and booking-service reads messages and reacts.
+
+Start with a simple notification: an admin cancels an event, event-service publishes EventCancelled, and booking-service handles it. This lets you learn sending, reading, errors, and duplicate checks before messages control seat confirmation in Phase 12.
+
+Words used in this phase:
+
+- **Envelope:** shared outer fields on every message, including its unique id, type, version, and time.
+- **Payload:** the data describing what happened.
+- **Serializer / deserializer:** code converting a Java object to message data / converting message data back to an object.
+- **Listener:** a method called when a message arrives.
+- **Acknowledgement:** recording that a message has been handled so the group can move forward.
+- **Retry topic:** a separate stream holding messages to try again later.
+- **DLT (Dead Letter Topic):** a separate stream for work that still failed after the allowed attempts.
+- **Deduplication:** using saved message ids to avoid applying a repeated message twice.
+
+Start by looking at one message's fields. Then follow it from the producer to the listener and finally to the database change.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. The event envelope
 
-Every message shares a wrapper. Without one, each consumer invents its own parsing and there is no
-consistent place to put a message id.
+Every message uses the same outer structure, called an **envelope**. It gives consumers a consistent place to find the message id, type, version, and other shared information.
 
 ```json
 {
@@ -28,30 +47,23 @@ consistent place to put a message id.
 
 **Each field earns its place:**
 
-- **`messageId`** — unique per message. **Phase 9's `processed_messages` deduplicates on it.** Without
-  it there is no way to build an idempotent consumer. Generate it at publish time, once — never
-  regenerate it on a retry, or the dedup is worthless.
-- **`eventType`** — lets one topic carry several types (Phase 10a, concept A8) and lets a consumer skip
-  what it does not care about.
-- **`version`** — schema version. When you must break the shape, `version: 2` messages can be routed to
-  different handling while `version: 1` messages still in the log continue to work.
-- **`occurredAt`** — when the fact happened, not when it was consumed. Consumers may lag by hours.
-- **`correlationId`** — Phase 3's id, now crossing the async boundary. Without it, the trace dies at the
-  producer and you cannot connect a user's request to what happened five seconds later.
+- **`messageId`:** a unique id saved in Phase 9's `processed_messages` table. Generate it once when creating the message, then keep it for retries so duplicate checks work.
+- **`eventType`:** says what happened and lets consumers choose which messages to handle.
+- **`version`:** identifies the message format so incompatible formats can be handled separately.
+- **`occurredAt`:** records when the event happened, rather than when the consumer read it.
+- **`correlationId`:** connects this message to the logs for the original request.
+- **`payload`:** contains the details needed to handle the event.
 
 ## A2. Serialisation, and the trusted-packages trap
 
-Spring's `JsonSerializer` adds a header `__TypeId__` containing the **fully qualified Java class name**,
-and `JsonDeserializer` uses it to pick a class.
+By default, Spring's `JsonSerializer` can send the full Java class name in a `__TypeId__` header. `JsonDeserializer` can use that header to choose the class it creates. This is convenient inside a shared Java setup, but needs care across services.
 
 **Convenient, and wrong across services**, for two reasons:
 
-1. It hard-couples the consumer to the producer's package names. Move a class and every consumer breaks.
-2. Deserialising into a class named by an attacker-controlled header is a **deserialisation
-   vulnerability**. `spring.json.trusted.packages` exists to limit it, and `*` defeats the point.
+1. A consumer becomes dependent on the producer's package and class names. Moving a class can break message reading.
+2. Reading a class name from an untrusted header can be unsafe. `spring.json.trusted.packages` limits allowed packages; using `*` removes that restriction.
 
-**Our approach:** turn type headers **off** on the producer, and have the consumer deserialise into
-**its own** envelope class, dispatching on the `eventType` **field** rather than a Java class name.
+**We turn off producer type headers.** Each consumer reads messages into its own envelope class and uses the `eventType` field to decide what to do. The contract is the JSON data, rather than a Java class name.
 
 ```
 producer: JsonSerializer, addTypeInfo = false
@@ -59,9 +71,7 @@ consumer: JsonDeserializer bound to ITS OWN envelope class
           switch on envelope.eventType()
 ```
 
-**Message contracts are data, not Java classes.** A consumer written in Go must be able to read your
-events; a Java class name in a header is meaningless to it. This is the same "copy the shape, never
-share the class" rule from Phase 6, applied to messages.
+**Agree on message data, not Java classes.** Another service, including one written in Go, should be able to read the message without knowing the producer's package names. This is the same separation used for DTOs in Phase 6.
 
 ## A3. Acknowledgement in Spring Kafka
 
@@ -74,25 +84,18 @@ share the class" rule from Phase 6, applied to messages.
 | `MANUAL` | when you call `ack.acknowledge()`, at the end of the batch |
 | `MANUAL_IMMEDIATE` | immediately when you call `acknowledge()` |
 
-**Never `enable.auto.commit=true`** — Phase 10a, concept A5: it commits on a timer unrelated to your
-work, giving you both loss and duplicates depending on timing.
+**Do not enable `enable.auto.commit=true` for this flow.** It can save the reading position on a timer rather than after the work finishes. That can lose work or cause repeats after failures.
 
-**We use `RECORD`.** Each message is committed after its listener returns normally; a thrown exception
-means no commit, so it is redelivered. That is at-least-once, which is what we want, and
-Phase 9's dedup handles the duplicates.
+**We use `RECORD`.** Spring saves the offset after a listener successfully handles the record. Failed processing goes through the error handler and retry policy. Because delivery can repeat, the database work still needs duplicate protection.
 
-**The subtlety worth knowing:** the listener returning is *not* the same as your database transaction
-committing. If the offset commit succeeds and the transaction later fails, you lose the work. Doing the
-database write and the dedup insert **in one transaction inside the listener**, before returning, is what
-makes this correct.
+**Finish the database transaction before the listener returns.** Save the business change and processed-message id together. If the offset is saved first but the database later fails, Kafka may move on even though the work was not saved.
 
 ## A4. Error handling: what should retry and what should not
 
 Two kinds of failure, and treating them alike is the mistake:
 
-- **Transient** — database down, network blip. Retry; it will succeed later.
-- **Permanent** — malformed JSON, an unknown event id, a business rule violated. Retrying forever
-  achieves nothing and blocks the partition.
+- **Temporary failure:** for example, a database or network is briefly unavailable. A later attempt may succeed.
+- **Permanent failure:** for example, the message cannot be parsed or violates a rule that will not change by waiting. Repeating it forever will not help.
 
 **`@RetryableTopic` implements non-blocking retry** (Phase 10a, concept A7):
 
@@ -100,12 +103,9 @@ Two kinds of failure, and treating them alike is the mistake:
 event.events ──fail──▶ event.events-retry-0 ──fail──▶ event.events-retry-1 ──▶ event.events-dlt
 ```
 
-The failed message is republished to a retry topic and the offset is committed, so **the main partition
-keeps moving**. Other messages are not held hostage by one bad one.
+A retry topic holds the failed message while the main partition continues. Other records do not have to wait for that retry.
 
-**The cost: ordering is lost for the retried message.** It will be processed after messages that came
-after it. For our seat operations that matters, which is why Phase 12 revisits this choice — sometimes
-blocking retry is the correct trade, precisely because it preserves order.
+**The cost is changed processing order.** The retried record may finish after later records. For seat operations, order matters, so Phase 12 considers when waiting on the same partition is the safer choice.
 
 `exclude` on `@RetryableTopic` sends permanent failures straight to the DLT with no retries. Always
 list your validation and not-found exceptions there.
@@ -161,9 +161,7 @@ spring:
       concurrency: 3
 ```
 
-**`localhost:29092`, not `9092`.** Phase 1's two-listener setup: our services run on the host, so they
-use the host listener. Using `9092` gives a connection that appears to work and then times out — the
-classic Docker/Kafka confusion.
+**Use `localhost:29092`, not `9092`.** The applications run on your computer rather than inside Docker, so they need Kafka's host listener from Phase 1. A wrong advertised address can connect initially and then fail on later requests.
 
 **`acks: all` + `enable.idempotence: true`** — Phase 10a, concept A4. Idempotence requires
 `acks=all`, `retries > 0` and `max.in.flight ≤ 5`; modern clients enforce it. Correct in dev even though
@@ -171,13 +169,10 @@ our single broker cannot demonstrate it.
 
 **`spring.json.add.type.headers: false`** — concept A2. No Java class names in your message contract.
 
-**`ErrorHandlingDeserializer` wrapping `JsonDeserializer`** — this one is important. Without it, a
-malformed message throws **inside the consumer's poll loop**, before any error handler runs, and the
-consumer **retries the same bad message forever**. A single unparseable message stops the partition
-permanently. The wrapper catches it and hands a null to the error handler, so it can go to the DLT.
+**`ErrorHandlingDeserializer` catches errors while reading message data.** Without it, invalid JSON can fail before the listener and its normal error handling are reached. The wrapper lets Spring pass the failure to the configured recovery path instead of leaving the consumer stuck on unreadable data.
 
 **`auto-offset-reset: earliest`** — a brand-new consumer group reads from the beginning. `latest` would
-silently skip everything published before it started, which during a deploy means quietly dropped
+without a clear error skip everything published before it started, which during a deploy means quietly dropped
 messages.
 
 **`concurrency: 3`** — three consumer threads, matching the three partitions. More would idle
@@ -242,7 +237,7 @@ change to deserialise safely. A map accepts anything and the consumer reads only
 
 The typed accessors keep the ugliness in one place. Jackson deserialises JSON numbers to `Integer` or
 `Long` depending on magnitude, so `(Long) payload.get("eventId")` throws a `ClassCastException` for
-small values — a genuinely nasty intermittent bug that these helpers prevent.
+small values — a really nasty intermittent bug that these helpers prevent.
 
 **`@JsonIgnoreProperties(ignoreUnknown = true)`** so producers can add envelope fields without breaking
 consumers. Same rule as Phase 6.
@@ -294,23 +289,17 @@ public class EventPublisher {
 }
 ```
 
-**`String.valueOf(eventId)` as the key is the load-bearing line.** Phase 10a, concept A3: same key →
-same partition → ordered. Every message about event 42 is ordered relative to every other message about
-event 42, while different events process in parallel.
+**`String.valueOf(eventId)` chooses the message key.** With the same partition setup, records for one event go to the same partition and have a defined order there. Different events can be handled on different partitions at the same time.
 
 **`MDC.get("correlationId")`** picks up Phase 3's id from the current request thread and carries it into
 the message. The trace now survives the async hop.
 
-**`whenComplete` is a callback, not a wait.** `send()` is asynchronous and returns a
-`CompletableFuture`. Calling `.get()` on it would block a request thread for the round trip — the exact
-thing async messaging exists to avoid.
+**`whenComplete` runs code when the send finishes.** It does not wait in the request thread. `send()` returns a `CompletableFuture`; calling `.get()` there would hold the request thread while waiting for Kafka's answer.
 
 **And here is the problem this design still has, stated plainly:** if the publish fails, all we do is
 log. The database change already committed. **The event is lost and nothing will retry it.**
 
-That is the **dual-write problem**, and it is what Phase 11's outbox exists to solve. Notice that no
-amount of error handling in this method fixes it — the failure can be the process dying between the
-commit and the send.
+**This is the dual-write problem:** the database can commit before the message is safely sent. A process crash between those operations loses the notification. Logging errors cannot recover missing work without a saved record; Phase 11 adds that record.
 
 ## Step 4 — Publish from the domain
 
@@ -350,13 +339,9 @@ commit and the send.
 **Fat events** (Phase 10a, concept A8): the payload carries what a consumer needs, so nobody has to call
 back to event-service and recreate the synchronous coupling.
 
-**`bookedSeats` on the cancellation** is a good example of thinking about the consumer: booking-service
-will want to know how many bookings are affected, and by the time it consumes, that number may have
-changed. **The event carries the fact as it was.**
+**The cancellation message includes `bookedSeats` as it was when the event happened.** The count could change before a consumer reads it. Including the value lets the consumer understand that past event without looking up today's value.
 
-**Note the publish sits inside `@Transactional`.** That is worse than it looks, and worth naming now:
-the send may go out and *then* the transaction rolls back. Consumers would react to an event that never
-happened. Phase 11 fixes this properly.
+**Sending inside `@Transactional` does not join Kafka to the database transaction.** The message may be sent and then the database may roll back. Consumers would hear about a change that did not commit. The outbox in Phase 11 addresses this.
 
 ## Step 5 — The consumer
 
@@ -417,18 +402,11 @@ public class EventEventsConsumer {
     }
 ```
 
-**`groupId = "booking-service"`** — Phase 10a, concept A3. Every instance of booking-service shares this
-group, so each message is handled once across the whole service. A second service consuming the same
-topic uses its own group and gets its own copy.
+**All instances of booking-service use `groupId = "booking-service"`.** They share partition work rather than each independently reading every record. Delivery can still repeat after failures. An independent service uses a different group to read the same topic for its own job.
 
-**`MDC.put(...)` restores the correlation id**, so log lines in this consumer join the trace that started
-in the user's HTTP request minutes ago. **`MDC.clear()` in a `finally`** — Phase 3's thread-local rule.
-Kafka listener threads are long-lived and reused for thousands of messages, so a leaked value would
-poison every later log line.
+**`MDC.put(...)` puts the original correlation id back into the consumer's log context.** This connects message handling to the earlier HTTP request. Always call `MDC.clear()` in `finally`, because the listener thread will be reused for other messages.
 
-**`default -> log.warn` and continue, not throw.** An unknown event type means the producer added
-something new; that is not an error for us. Throwing would send perfectly valid messages to the DLT.
-**Ignore what you do not understand; fail only on what you cannot handle.**
+**For an unknown event type, use `default -> log.warn` and continue.** It may be a new type this consumer does not need. Do not treat it as a broken message just because this service has no handler for it.
 
 **Now the handler, with the dedup that makes it correct:**
 
@@ -481,11 +459,7 @@ cancel bookings ✗ failed
 → redelivery is skipped as a duplicate. The bookings are never cancelled. Silent loss.
 ```
 
-Phase 9, step 8 said this; here is where it bites. **Restructure so the dedup insert happens inside the
-same `@Transactional` method as the work** — either move the dedup call into
-`cancelAllBookingsForEvent`, or make the listener method itself transactional. As written above they
-are two transactions, which is a bug **left visible on purpose**: find it, then fix it, and you will
-never write it again.
+**Save the duplicate-check record and business change in the same `@Transactional` method.** Move the check into `cancelAllBookingsForEvent`, or make the listener method transactional. As written, the example uses two transactions. That is a known learning exercise: if one commits and the other fails, a retry can be skipped even though the business work did not finish.
 
 Add `cancelBySystem` to the `Booking` aggregate — a cancellation with no owner check, because the system
 is acting, not the user.
@@ -522,20 +496,15 @@ is acting, not the user.
     }
 ```
 
-**`exclude` is the line that stops pointless work.** A malformed message will fail identically on every
-attempt; four tries and three sleeps achieve nothing except delay. Permanent failures go straight to the
-DLT. **Classifying your exceptions is the actual work here** — the annotation is trivial.
+**`exclude` lists failures that should not be retried.** Repeating an unreadable message or a permanently invalid action only delays other work. Send it to the DLT through the configured recovery path. Decide which exceptions are temporary and which need repair.
 
 **`autoCreateTopics = "false"`** because we created the DLTs deliberately in Phase 10a. Auto-creation
 hides typos.
 
-**Backoff: 1 s → 2 s → 4 s.** Long enough for a database restart, short enough that a transient blip
+**Backoff: 1 s → 2 s → 4 s.** Long enough for a database restart, short enough that a temporary blip
 recovers quickly.
 
-**Understand what `@RetryableTopic` actually does** (Phase 10a, concept A7): the failed message is
-**republished** to a retry topic and the original offset is **committed**. The main partition keeps
-moving — and **the retried message is now out of order relative to its siblings.** For `EventCancelled`
-that is acceptable. For seat reservations in Phase 12 it is not, and we will choose differently there.
+**`@RetryableTopic` sends the failed message to another topic, then saves the original offset.** The main topic continues, so the retry can finish after later messages. This is acceptable for the notification example here. Phase 12 chooses differently for seat operations that need their processing order preserved.
 
 ## Step 7 — Run it
 
@@ -668,7 +637,7 @@ docker exec -it ebp-kafka /opt/kafka/bin/kafka-console-consumer.sh \
 **Now the important observation: check the main topic's lag.** It is **zero**. The partition kept moving
 while the bad message went off to be retried elsewhere. That is non-blocking retry earning its keep.
 
-Then remove `ErrorHandlingDeserializer` from the config and send genuinely malformed JSON. The consumer
+Then remove `ErrorHandlingDeserializer` from the config and send really incorrectly formatted JSON. The consumer
 now **loops forever** on the same message, at full speed, filling your logs, and nothing behind it is
 processed. **One bad message stopped a partition permanently** — the failure mode that config line
 exists to prevent.
@@ -730,12 +699,12 @@ send. **This is Phase 11.**
 | Type headers enabled across services | Consumer coupled to producer packages; unsafe | `add.type.headers: false` |
 | `trusted.packages: "*"` | Deserialisation vulnerability | Name your packages |
 | `enable-auto-commit: true` | Loss *and* duplicates | Manual / `RECORD` ack |
-| `auto-offset-reset: latest` on a new group | Silently skips existing messages | `earliest` |
+| `auto-offset-reset: latest` on a new group | Without a clear error skips existing messages | `earliest` |
 | Dedup insert in a separate transaction | Silent data loss on failure | One transaction |
 | No `messageId` | Cannot deduplicate at all | Always include it |
 | Regenerating `messageId` on retry | Dedup never matches | Generate once, at publish |
 | Throwing on unknown event types | Valid messages sent to the DLT | Log and ignore |
-| No `exclude` on `@RetryableTopic` | Malformed messages retried pointlessly | List permanent failures |
+| No `exclude` on `@RetryableTopic` | Incorrectly formatted messages retried pointlessly | List permanent failures |
 | No `@DltHandler` | Failures are invisible | Log and alert |
 | MDC not cleared in the listener | Wrong correlation ids for thousands of messages | `finally { MDC.clear(); }` |
 | `concurrency` > partition count | Idle threads | Match the partitions |
@@ -743,19 +712,17 @@ send. **This is Phase 11.**
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Alert on consumer lag and on DLT depth.** These two graphs tell you almost everything.
-- **A DLT replay tool** — an admin endpoint that republishes a DLT message to the main topic after the
-  bug is fixed. Manual `kafka-console-producer` at 3am is not a strategy.
-- **Schema registry** (Avro/Protobuf) if the message contract matters across teams.
-- **Idempotent consumers everywhere**, without exception.
-- **Never publish personal data** you may have to delete; retention and compaction make deletion hard.
-- **Watch rebalance frequency**; tune `max.poll.records` down if processing is slow.
-- **Consumer concurrency ≤ partition count.**
-- **Separate the transaction boundary from the listener** so the database work and the dedup commit
-  together and the offset commits after.
-- **Metrics per event type**, not just per topic — you want to know *which* event is failing.
+- **Alert on lag and DLT size.** These show delayed work and work that failed.
+- **Provide a reviewed way to replay DLT messages** after fixing the cause, rather than relying on ad hoc terminal commands during a failure.
+- **Consider a schema registry** when several teams share message formats.
+- **Protect every consumer against duplicates**, using a saved message id with its database changes.
+- **Avoid personal data you may need to delete later.** Stored message histories and replay make deletion more complicated.
+- **Watch repeated rebalances.** If processing is slow, a smaller `max.poll.records` can reduce work per poll.
+- **Keep active consumers within the useful partition count.** Extra consumers in a group do not add partition capacity.
+- **Commit database work and the duplicate record together**, before the listener returns and the offset is saved.
+- **Measure failures by event type**, so you can tell which kind of work is failing inside a topic.
 
 ---
 

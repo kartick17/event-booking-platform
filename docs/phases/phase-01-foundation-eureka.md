@@ -11,13 +11,35 @@
 2. PostgreSQL, Redis and Kafka running locally through Docker Compose.
 3. A Eureka server running at `http://localhost:8761` with a dashboard you can open.
 4. An `auth-service` skeleton that registers itself in Eureka and answers `GET /ping`.
-5. A clear mental model of what "service discovery" really means.
+5. A clear understanding of what "service discovery" really means.
 
 No business logic yet. This phase is the ground everything else stands on.
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase sets up the project and the tools it needs on your computer. You will not build booking features yet. First, make sure the services can start and find each other.
+
+Picture a phone book. A service tells Eureka its name and address. Another service looks up that name when it needs to call it. If you run two copies of a service, Eureka can list both.
+
+Words used in this phase:
+
+- **Service:** a separate application with one main job, such as login or bookings.
+- **Monorepo:** one Git repository containing several applications.
+- **Maven module:** one part of the project that Maven can build.
+- **Dependency:** a library your application needs. A **POM** tells Maven which libraries and settings to use.
+- **BOM:** a list of library versions chosen to work together.
+- **Container:** an isolated environment for running a tool such as PostgreSQL. Docker Compose starts several containers from one file.
+- **Instance:** one running copy of a service.
+- **Registry:** the list of service names and addresses kept by Eureka.
+- **Heartbeat:** a regular message saying, "I am still running."
+
+Start with Part A, then follow the existing build steps in order. The first useful result is seeing auth-service appear in Eureka.
+
+---
+
+# PART A — Understand the ideas
 
 Read this part before typing anything. It is 20 minutes and it makes the rest obvious.
 
@@ -37,7 +59,7 @@ All services live in **one Git repository**. The opposite is polyrepo — one re
 
 We use a monorepo because you are one person learning. Real companies use both. Netflix and Uber use polyrepo; Google and Meta use one giant monorepo.
 
-**The important part:** monorepo is about *where the code sits*, not about *how it runs*. Each service still builds its own jar, has its own database, and can be deployed alone. If you ever find yourself unable to deploy one service without the others, the monorepo has turned into a **distributed monolith** — the worst of both worlds.
+**The main point:** a monorepo puts the code in one place. It does not make the services one application. Each service still has its own jar and database and can be released separately. If changing one service forces you to release the others too, they are too closely connected. This problem is called a **distributed monolith**.
 
 ### What Maven multi-module means
 
@@ -50,7 +72,7 @@ pom.xml              <- parent, packaging = pom, builds nothing
 └── services/auth-service/pom.xml         -> auth-service.jar
 ```
 
-When you run `mvn clean install` in the root, Maven starts the **reactor**: it reads all modules, works out the order they depend on each other, and builds them one by one.
+When you run `mvn clean install` at the root, Maven finds the modules, checks which ones depend on others, and builds them in the right order. Maven calls this build process the **reactor**.
 
 ### Two POM ideas you must not mix up
 
@@ -71,11 +93,11 @@ with **no `<version>`**. The version comes from the parent's `dependencyManageme
 
 ### What a BOM is
 
-**BOM = Bill of Materials.** A special POM that contains only `dependencyManagement` — a giant list of "these 300 libraries are tested to work together at these versions."
+**BOM = Bill of Materials.** It is a POM containing a list of library versions under `dependencyManagement`. The list tells Maven which versions should work together.
 
-Spring Cloud ships one. You import it, and every Spring Cloud library you use afterwards gets a version that is known to work with your Spring Boot version. Without it you will hit `NoSuchMethodError` at runtime, which is the worst kind of bug: it compiles fine.
+Spring Cloud provides a BOM. Importing it gives your Spring Cloud libraries matching versions. Choosing versions separately can cause errors such as `NoSuchMethodError`: the code builds, but a library method is missing when the application runs.
 
-> **Interview line:** "`dependencyManagement` pins versions without adding them to the classpath. A BOM is a POM made only of `dependencyManagement`, imported with `scope=import`, so one line pins a whole ecosystem."
+> **How to explain it:** "`dependencyManagement` chooses library versions; it does not add the libraries to the application. Importing a BOM with `scope=import` lets us use a whole list of matching versions."
 
 ### Version compatibility — do not skip this
 
@@ -88,7 +110,7 @@ Spring Boot and Spring Cloud versions are **paired**. A wrong pair fails at star
 | 3.4.x | 2024.0.x |
 | 3.5.x | 2025.0.x |
 
-We pin **Spring Boot 3.3.4 + Spring Cloud 2023.0.3 + Java 21**. That pair is stable and every tutorial you find will match it. If you want a newer pair, check the official matrix at `spring.io/projects/spring-cloud` first and change both numbers together, never one.
+This project uses **Spring Boot 3.3.4 + Spring Cloud 2023.0.3 + Java 21**. Keep these versions while following the steps. If you choose to upgrade later, check the compatibility table at `spring.io/projects/spring-cloud` and choose a matching Boot and Cloud pair.
 
 ---
 
@@ -138,11 +160,11 @@ Now booking-service says `http://event-service/api/v1/events/42` — a **logical
 
 ### The three moving parts
 
-**1. Registration.** On startup, the Eureka *client* inside each service POSTs its own details to the Eureka server: application name, IP, port, health URL, a status of `UP`, and an `instanceId`.
+**1. Registration.** When a service starts, its Eureka client sends its name, IP address, port, health-check URL, `UP` status, and `instanceId` to Eureka. This adds one running copy to the service list.
 
-**2. Heartbeat (lease renewal).** Every **30 seconds** the client PUTs a heartbeat. Think of registration as signing a rental lease and the heartbeat as paying rent. Miss the rent for **90 seconds** and the lease expires — the server marks the instance for removal.
+**2. Heartbeat (lease renewal).** Every **30 seconds**, the client tells Eureka it is still running. If no heartbeat arrives for **90 seconds**, the registration expires and the server can remove it. The registration is also called a **lease**.
 
-**3. Lookup (registry fetch).** Every **30 seconds** each client downloads the whole registry and keeps it in memory. This is the part most people miss: **clients do not ask Eureka on every request.** They ask their own local copy. That is why calls stay fast, and why Eureka being down does not immediately break anything.
+**3. Lookup (registry fetch).** Every **30 seconds**, each client downloads the service list and saves a copy in memory. **It does not call Eureka for every request.** It uses its saved list to find an address. Calls are fast, but the saved list can briefly contain old addresses.
 
 ### Client-side vs server-side load balancing
 
@@ -152,7 +174,7 @@ Now booking-service says `http://event-service/api/v1/events/42` — a **logical
 booking ──▶ load balancer ──▶ event instance 2
 ```
 
-**Client-side** (what we use): booking-service already *has* the instance list from Eureka. It picks one itself — round robin by default — and calls it directly. No extra hop.
+**Client-side** means the calling application chooses the address. Booking-service uses its saved Eureka list, picks an event-service instance, and calls it directly. With round robin, it takes turns between the available instances.
 
 ```
 booking (picks instance 2 itself) ──▶ event instance 2
@@ -174,7 +196,7 @@ These defaults explain almost every "why is my service not showing up" question.
 
 Add them up: a **dead** instance can stay in another service's list for up to **90 + 60 + 30 + 30 ≈ 3.5 minutes**.
 
-That number is not a bug. It is a deliberate trade. Eureka chose **availability over consistency** (the AP side of CAP): it would rather hand you a slightly stale list than refuse to answer. The cost is that *your calling code must survive calling a dead instance*. That is exactly why Phase 7 (Resilience4j retry + circuit breaker) exists. Discovery and resilience are two halves of one idea.
+Eureka may return an old service list so that callers can keep working. This favours **availability**: answering requests even when the list may not be fully current. It is an example of the AP choice in CAP. The cost is that a caller may try a service that has already stopped. Phase 7 teaches how to handle that failure.
 
 ### Eureka's internal caches
 
@@ -190,13 +212,13 @@ readWriteCacheMap        (invalidated immediately on register/cancel)
 readOnlyCacheMap         <- this is what clients actually read
 ```
 
-So even on the server side, a fresh registration can take up to 30 seconds to be visible to clients. In development we shrink these numbers so feedback is fast. **In production you leave the defaults**, because low intervals × many instances = a lot of traffic hitting the registry.
+A newly registered service may take up to 30 seconds to appear in responses from the server cache. We shorten these times during development so changes appear sooner. Keep the normal settings for production: frequent refreshes from many services would create extra traffic.
 
 ### Self-preservation mode
 
-If Eureka suddenly stops receiving heartbeats from **more than 15%** of instances in 15 minutes, it assumes *the network is broken, not the services*, and it **stops evicting anything**.
+If too many expected heartbeats stop arriving, Eureka may assume there is a network problem. In **self-preservation mode**, it pauses automatic removal of registrations. The threshold described here is more than 15% missing heartbeats over 15 minutes.
 
-Reasoning: a network split is more likely than every service dying at once. Wrongly keeping a dead instance is recoverable — the caller retries. Wrongly deleting every healthy instance takes the whole system down.
+The reason is simple: losing network contact does not prove a service stopped. Keeping an old address allows a caller to try again. Removing healthy services from the list could stop callers from finding them at all.
 
 On your laptop this is annoying: you stop a service, and it stays listed as `UP` forever. So we turn it off **in dev only** and leave it on in production.
 
@@ -204,7 +226,7 @@ On your laptop this is annoying: you stop a service, and it stays listed as `UP`
 
 - **You are on Kubernetes.** K8s has a built-in registry: a `Service` object gives you a stable DNS name and load balancing. Running Eureka there duplicates it.
 - **You have 2–3 services with fixed addresses that never change.** Config is simpler.
-- **You need strong consistency of the registry.** Eureka is AP. Consul and etcd are CP — they would rather return an error than stale data.
+- **You need strong consistency of the registry.** Eureka is AP. Consul and etcd are CP — they would rather return an error than out of date data.
 
 We use it because it is the clearest way to *see* registration, heartbeats and eviction happening, and because plenty of real Spring shops still run it.
 
@@ -218,11 +240,11 @@ Why not dockerise our services too? Because you want breakpoints, hot reload, an
 
 ### One Postgres container, three databases
 
-Real production: three separate database servers, or at least three separate instances. Locally, one container with three databases inside is enough — the rule that matters is **no service reads another service's tables**, and that rule is enforced by us, not by the container count.
+For local learning, one Postgres container can hold three separate databases. The important rule is that **each service uses only its own database**. In production, these databases can also run on separate servers or instances.
 
 ### Kafka in KRaft mode
 
-Old Kafka needed **ZooKeeper**, a second cluster just to store metadata. Modern Kafka (3.3+) uses **KRaft** — Kafka manages its own metadata. One container instead of two. We use KRaft.
+Older Kafka setups used another system, **ZooKeeper**, to keep information about the Kafka cluster. **KRaft** lets Kafka manage that information itself. This project uses KRaft, so we do not need a ZooKeeper container.
 
 ### The two-listener trick (this confuses everyone)
 
@@ -231,7 +253,7 @@ Kafka tells clients where to reach it. That address must be correct *from the cl
 - A client **inside** the Docker network reaches it at `kafka:9092`.
 - A client **on your host** (your Spring app in the IDE) reaches it at `localhost:29092`.
 
-One address cannot be both. So Kafka gets **two listeners** and advertises the right one on each. Our Spring apps run on the host, so they will use `localhost:29092`.
+Kafka needs different addresses for applications inside Docker and applications on your computer. A **listener** is an address where it accepts connections. We configure both kinds. Our Spring applications run on your computer and use `localhost:29092`.
 
 ---
 
@@ -292,10 +314,10 @@ Start with just this:
 
 **Why each part:**
 
-- `<parent>` is `spring-boot-starter-parent`. It gives us the version of every Spring library, sensible plugin config, and UTF-8 defaults — for free.
-- `<relativePath/>` empty means "do not look for this parent on disk, download it." Without it Maven searches `../pom.xml` and warns.
-- `<packaging>pom</packaging>` is the line that makes this a parent. It produces **no jar**. Its only job is to hold config and list modules.
-- `1.0.0-SNAPSHOT`: `SNAPSHOT` means "in development, may change." Maven treats snapshot versions specially — it re-checks them instead of caching forever.
+- `<parent>` uses `spring-boot-starter-parent` to supply library versions, plugin settings, and UTF-8 defaults.
+- An empty `<relativePath/>` tells Maven to download that parent rather than search for it in `../pom.xml`.
+- `<packaging>pom</packaging>` means this module produces no application jar. It holds shared build settings and the module list.
+- `1.0.0-SNAPSHOT` marks a version still being developed. Maven can check for newer copies of a snapshot rather than treating it as a fixed release.
 
 ### 2b. Properties
 
@@ -337,7 +359,7 @@ Only what exists. Maven fails the build if a listed module folder has no POM. We
     </dependencyManagement>
 ```
 
-`<type>pom</type>` + `<scope>import</scope>` together mean: "do not add this as a library — open it up and copy all its version pins into mine." That is the BOM import. After this, no child module writes a Spring Cloud version again.
+`<type>pom</type>` and `<scope>import</scope>` tell Maven to read this POM as a version list, rather than add it as a library. Child modules can then use those Spring Cloud versions without repeating the version numbers.
 
 ### 2e. Checkpoint
 
@@ -388,11 +410,11 @@ volumes:
 
 **Why each part:**
 
-- `alpine` image: small, fast to pull.
-- `"5432:5432"` = `host:container`. Left side is what you type in your app config.
-- The named volume `postgres_data` keeps your data when the container restarts. Delete it with `docker compose down -v` when you want a clean slate.
-- Anything mounted into `/docker-entrypoint-initdb.d/` runs **once**, the first time the data directory is empty. If you edit the SQL later it will *not* re-run — you must `down -v` first. This trips up everyone once.
-- `healthcheck` lets other containers wait for Postgres to be genuinely ready, not just started.
+- The `alpine` image is a small download.
+- `"5432:5432"` means `host:container`: applications on your computer use the port on the left.
+- The `postgres_data` volume keeps data after a container restart. `docker compose down -v` deletes the volumes and their data for a fresh local start.
+- Scripts in `/docker-entrypoint-initdb.d/` run only when the database data directory is first created. Editing the SQL later does not rerun it. A fresh local reset with `down -v` lets it run again.
+- A `healthcheck` checks whether Postgres is ready to answer, rather than only whether the container has started.
 
 ### 3b. The database creation script
 
@@ -406,7 +428,7 @@ CREATE DATABASE booking_db;
 
 Three databases, one per service. This file is the physical shape of "database per service."
 
-Later, when we add Flyway, each service will create its **own tables inside its own database**. No service gets credentials for another's database. That is the boundary — and it is a boundary you must keep by discipline, because nothing here technically stops you from breaking it.
+Later, Flyway will create the tables inside each service's own database. **Do not read or change another service's tables.** This keeps services separate even though the local databases share one Postgres container.
 
 ### 3c. Start it and verify
 
@@ -446,7 +468,7 @@ Add to `docker-compose.yml`, inside `services:`:
 
 And add `redis_data:` under the `volumes:` block at the bottom.
 
-`--appendonly yes` turns on Redis persistence (writes an append-only log to disk). For a cache you often do not need it. We enable it now because in Phase 8 Redis holds distributed locks, and losing those on a restart is worth understanding rather than hiding.
+`--appendonly yes` tells Redis to save writes in a log on disk. A cache can often be rebuilt without this. We enable it here because Phase 8 also uses Redis for locks, where restart behaviour matters.
 
 Verify:
 
@@ -483,11 +505,11 @@ Add to `services:`:
 
 **Why each part — you will meet all of these again in Phase 10:**
 
-- `KAFKA_PROCESS_ROLES: broker,controller` — one container plays both roles. That is KRaft mode. Real clusters split them.
-- Three listeners: `PLAINTEXT` for container-to-container, `CONTROLLER` for KRaft's internal metadata traffic, `PLAINTEXT_HOST` for you.
-- `KAFKA_ADVERTISED_LISTENERS` is the important one. This is the address Kafka **hands back to clients** after they connect. Get it wrong and your app connects once, then times out trying to reach the address it was given. Your Spring apps will use `localhost:29092`.
-- Replication factor `1` everywhere: we have one broker, so nothing can be replicated. In production these are `3`, and `MIN_ISR` (minimum in-sync replicas) is `2` — meaning a write must reach 2 replicas before it counts. Phase 10 covers this properly.
-- `GROUP_INITIAL_REBALANCE_DELAY_MS: 0` — normally Kafka waits 3 seconds before rebalancing a consumer group so late joiners are included. In dev you want instant.
+- `KAFKA_PROCESS_ROLES: broker,controller` gives this one container both jobs: storing messages and managing cluster information. A real cluster may separate them.
+- The listeners have different jobs: `PLAINTEXT` accepts container connections, `CONTROLLER` handles KRaft coordination, and `PLAINTEXT_HOST` accepts connections from your computer.
+- `KAFKA_ADVERTISED_LISTENERS` contains the addresses Kafka gives clients after they connect. The addresses must be reachable from those clients. Our Spring applications use `localhost:29092`.
+- Replication factor `1` means each partition has one copy because there is only one broker. A common production setup uses `3` copies and `MIN_ISR` of `2`, requiring at least two in-sync copies for the intended reliable writes. Phase 10 explains these settings.
+- `GROUP_INITIAL_REBALANCE_DELAY_MS: 0` removes the initial wait before assigning partitions to a consumer group. This makes local exercises start sooner.
 
 Verify:
 
@@ -554,9 +576,9 @@ All three healthy. Infrastructure done.
 
 **The three things to notice:**
 
-1. `<parent>` points **up** at our root POM, with a real `relativePath`. This is what makes it a child module. Parent→child in `<modules>`, child→parent in `<parent>`. Both directions must exist.
-2. The Eureka dependency has **no `<version>`**. It comes from the Spring Cloud BOM you imported in step 2d. This is that BOM doing its job.
-3. `spring-boot-maven-plugin` — without it you get a plain jar with no `main` manifest and no dependencies inside, and `java -jar` fails. With it you get an **executable fat jar**: your classes plus every dependency, plus a launcher that knows how to load them.
+1. `<parent>` points to the root POM through `relativePath`. The root lists the child in `<modules>`, and the child names the parent in `<parent>`.
+2. The Eureka dependency needs no `<version>` here because the Spring Cloud BOM from Step 2d supplies it.
+3. `spring-boot-maven-plugin` builds a jar you can run with `java -jar`. It includes your code, the required libraries, and a launcher. This is often called a **fat jar**.
 
 Note there is **no `<groupId>` and no `<version>`** on this module — both are inherited from the parent. Less to keep in sync.
 
@@ -583,12 +605,12 @@ public class ServiceDiscoveryApplication {
 
 **What the two annotations actually do:**
 
-`@SpringBootApplication` is three annotations in one:
-- `@Configuration` — this class can define beans.
-- `@EnableAutoConfiguration` — scan every jar on the classpath for auto-configuration classes and apply the ones whose conditions match. This is why adding a dependency changes behaviour with no code.
-- `@ComponentScan` — scan **this package and everything below it** for `@Component`, `@Service`, `@Repository`, `@Controller`. This is why your main class must sit in the **topmost package**. Put it in `com.eventbooking.discovery.config` by mistake and your controllers in `com.eventbooking.discovery.api` are invisible. Very common bug.
+`@SpringBootApplication` combines three annotations:
+- `@Configuration` lets this class define objects managed by Spring, called beans.
+- `@EnableAutoConfiguration` lets Spring set up features based on the libraries and settings it finds. That is why adding a dependency can change application behaviour.
+- `@ComponentScan` finds classes marked with `@Component`, `@Service`, `@Repository`, and `@Controller` in this package and its subpackages. Put the main class in the top package so sibling packages are included. For example, a main class in `com.eventbooking.discovery.config` would not automatically find controllers in `com.eventbooking.discovery.api`.
 
-`@EnableEurekaServer` imports a marker bean. Eureka's auto-configuration is written as `@ConditionalOnBean(EurekaServerMarkerConfiguration.Marker.class)` — so the whole Eureka server only wires itself up when that marker exists. That is the standard Spring `@EnableXxx` pattern: the annotation is a switch, the real work is in auto-configuration.
+`@EnableEurekaServer` turns on Eureka server setup. It adds a marker object; Spring sees that marker and creates the needed server components automatically. Other Spring annotations named `@EnableXxx` often follow the same idea.
 
 ### 4c. Configuration
 
@@ -614,11 +636,11 @@ eureka:
 
 **Line by line, because every one of these matters:**
 
-- `8761` is Eureka's conventional port. Not a rule, but every Spring developer expects it there.
-- `spring.application.name` is **the identity of a service**. Eureka uses it as the registry key, the gateway routes by it, Feign looks it up by it. Forget it and your service registers as `UNKNOWN`.
-- `register-with-eureka: false` — the Eureka server is itself a Eureka client by default. With one server, registering with itself is noise. In a production cluster of 2–3 Eureka servers you set this to `true` so they replicate to each other.
-- `fetch-registry: false` — same reason: don't download a registry from yourself.
-- `defaultZone` is the address clients use. "Zone" is Eureka's word for an availability zone (an AWS idea). One zone here.
+- `8761` is the usual Eureka server port.
+- `spring.application.name` is the service name used by Eureka, gateway routes, and Feign lookups. Without it, the service can appear as `UNKNOWN`.
+- `register-with-eureka: false` stops this single server from registering with itself. Multiple Eureka servers can instead register with one another to share the service list.
+- `fetch-registry: false` stops it from downloading its own service list.
+- `defaultZone` is the Eureka server address clients use. This project has one zone, meaning one grouping of service locations.
 
 ### 4d. Development-only tuning
 
@@ -631,7 +653,7 @@ Add under `eureka:`:
     response-cache-update-interval-ms: 5000
 ```
 
-This is the dev-only block from concept A2. Self-preservation off means killed services actually disappear. Eviction every 5 s and cache refresh every 5 s mean you see changes in seconds instead of minutes.
+These settings are only for development. Turning off self-preservation lets stopped services disappear from the list. Running removal and cache refresh every 5 seconds makes changes visible sooner.
 
 **Write a comment above it in the file: `# DEV ONLY — never ship these values.`** In production, self-preservation on and default intervals, or a network hiccup will empty your registry and take the system down.
 
@@ -706,7 +728,7 @@ In the root `pom.xml`, `<modules>` should now be:
     </modules>
 ```
 
-Both exist now, so `mvn -q validate` at the root should pass silently.
+Both exist now, so `mvn -q validate` at the root should pass without a clear error.
 
 ### 5c. Main class
 
@@ -727,7 +749,7 @@ public class AuthServiceApplication {
 }
 ```
 
-**No `@EnableEurekaClient`.** You will see that annotation in older tutorials. Since Spring Cloud 2020 it is unnecessary and deprecated: if `spring-cloud-starter-netflix-eureka-client` is on the classpath and `eureka.client.enabled` is not `false`, registration happens automatically. Auto-configuration by classpath presence — the modern Spring way.
+**You do not need `@EnableEurekaClient`.** Older tutorials show it. With the Spring Cloud version used here, adding `spring-cloud-starter-netflix-eureka-client` enables registration automatically, unless `eureka.client.enabled` is `false`.
 
 ### 5d. Configuration
 
@@ -758,9 +780,9 @@ management:
 
 **The two lines under `eureka.instance` are the ones worth understanding:**
 
-`prefer-ip-address: true` — by default a service registers under its **hostname**. On a laptop that is something like `weloin-thinkpad`, which other machines cannot resolve. Registering the IP avoids a whole class of "works on my machine, DNS fails in the cluster" problems.
+`prefer-ip-address: true` registers the service using its IP address. Otherwise it may use your computer's hostname, such as `weloin-thinkpad`. Other computers may not know how to find that hostname.
 
-`instance-id: ${spring.application.name}:${server.port}` — the unique key for **this instance**. The default includes the hostname, so if you start two copies on the same machine they can collide and overwrite each other in the registry. Making the port part of the id keeps them separate. Try it later: run auth-service on 8081 and 8091 and watch two instances appear under one application name.
+`instance-id: ${spring.application.name}:${server.port}` identifies this running copy by its service name and port. Different copies need different ids so their registrations do not replace one another. Run auth-service on ports 8081 and 8091 later and check that Eureka lists both.
 
 `management.endpoints.web.exposure.include` — actuator hides most endpoints by default. We open only `health` and `info`. Opening everything (`*`) in production leaks heap dumps, environment variables and beans. Never do it.
 
@@ -796,7 +818,7 @@ public class PingController {
 }
 ```
 
-Why return the port? Because in a minute you will run two instances and call through a load balancer. Seeing the port flip between responses is how you *watch* client-side load balancing happen instead of taking my word for it.
+The response includes the port so you can tell which running copy answered. Later, with two copies and a load balancer, different response ports will show that requests are reaching both copies.
 
 Note the package: `com.eventbooking.auth.api`. Below `com.eventbooking.auth`, so component scanning finds it. This is the `api/` layer from the roadmap's package structure — controllers and DTOs only.
 
@@ -840,7 +862,7 @@ curl -H "Accept: application/json" http://localhost:8761/eureka/apps | python3 -
 
 Read the `instance` object in the output. You will find `app`, `ipAddr`, `port`, `status`, `healthCheckUrl`, and a `leaseInfo` block with `renewalIntervalInSecs: 30` and `durationInSecs: 90`.
 
-**This JSON is the whole of service discovery.** Every client downloads exactly this every 30 seconds, keeps it in memory, and picks an instance from it. There is no magic left after you have read this response once.
+**This JSON is the service list.** Clients download it, keep a copy in memory, and choose an address from it. Reading it once helps make service discovery less abstract.
 
 ---
 
@@ -870,9 +892,9 @@ AUTH-SERVICE    n/a (2)     (2)     UP (2) - auth-service:8081 , auth-service:80
 
 Stop the 8091 copy with Ctrl-C. Watch the dashboard.
 
-With our dev settings it disappears within about 5–15 seconds. With **production defaults** it would take up to 90 s (lease expiry) + up to 60 s (eviction task) — and during that whole window, other services would still have it in their local list and would still try to call it.
+With the development settings, an instance that stops without unregistering should disappear after roughly 5–15 seconds. Normal production settings wait longer: registration expiry and the removal job both add delay. Until the list is updated, callers can still try the old address. A normal shutdown may unregister sooner, as the results note explains.
 
-**Sit with that.** Discovery cannot prevent calls to dead instances. It never could. That is why retry and circuit breakers are not optional extras — they are the other half of the design. Phase 7.
+**The lesson:** a service list can contain an address that no longer works. Discovery helps find services; it does not guarantee that every call succeeds. Phase 7 adds ways to handle those failures.
 
 ### Drill 2: kill Eureka, keep the services
 
@@ -882,7 +904,7 @@ Stop the Eureka server. Leave auth-service running.
 - `curl http://localhost:8081/ping` still works perfectly.
 - Any service that had already fetched the registry still has its cached copy and can still route calls.
 
-**Eureka being down does not take the system down.** It stops *new* information from spreading. This is the AP choice from concept A2, and it is why Eureka survives in production despite being a single logical point of coordination.
+**Services can keep working when Eureka stops** if they already have a saved service list. New registrations and address changes will not reach them until Eureka returns. This is the availability choice described in A2.
 
 Start Eureka again. auth-service re-registers on its next heartbeat.
 
@@ -892,7 +914,7 @@ Stop everything. Start auth-service **first**, then Eureka.
 
 auth-service fails its first registration attempts, logs the error, and **keeps retrying**. Once Eureka appears, it registers and everything is fine. No manual restart.
 
-Startup order does not matter in a well-built distributed system. If a system requires you to boot services in a fixed order, that is a design smell — it usually means somebody made a startup-time call that should have been retried or deferred.
+Services should recover when a dependency starts later. If a service only works when everything starts in a fixed order, check whether its startup calls need retries or should happen later.
 
 ---
 
@@ -904,20 +926,20 @@ Startup order does not matter in a well-built distributed system. If a system re
 | Main class in a sub-package | Controllers return 404 | Main class in the topmost package |
 | `eureka-server` dependency in a service | Weird startup errors | Services use `eureka-client` |
 | Edited `init.sql` after first run | New databases missing | `docker compose down -v` then up |
-| Expect instant removal on kill | Stale instance for minutes | Understand the timing table; tune in dev only |
+| Expect instant removal on kill | Out of date instance for minutes | Understand the timing table; tune in dev only |
 | Used `@EnableEurekaClient` | Deprecation warning | Delete it, classpath is enough |
 | Two instances overwrite each other | Only one shows in dashboard | Set `instance-id` with the port |
 | Copied prod-tuned intervals into prod | Registry churn under load | Dev-only block stays dev-only |
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Run 2–3 Eureka servers** that register with each other (`register-with-eureka: true`, `defaultZone` listing the peers). Registry replication between them is eventually consistent.
-- **Secure the Eureka endpoints.** An open registry tells an attacker your whole internal topology. Put it behind auth or a private network.
-- **Leave the default timings alone.** They were tuned at Netflix scale.
-- **Never hardcode `defaultZone`** in the jar. It comes from an environment variable per environment. Phase 3 covers configuration management properly.
-- **Health checks:** by default Eureka reports `UP` if the process is alive. Set `eureka.client.healthcheck.enabled=true` to make it report the *actuator* health instead — so a service with a dead database correctly reports `DOWN` and stops receiving traffic. We will turn this on in Phase 4, once there is a database to be unhealthy about.
+- **Run 2–3 Eureka servers when needed.** Use `register-with-eureka: true` and list the other servers in `defaultZone`. Updates take time to spread, so their lists may briefly differ.
+- **Protect Eureka endpoints.** The registry reveals service names and addresses. Require authentication or private network access.
+- **Keep the normal timing defaults in production** unless measurements justify a change.
+- **Supply `defaultZone` through the environment** rather than putting a deployment-specific address inside the jar.
+- **Connect health checks in Phase 4.** `eureka.client.healthcheck.enabled=true` lets the service report `/actuator/health`, including database health. That helps Eureka reflect an unusable database instead of only a running process.
 
 ---
 

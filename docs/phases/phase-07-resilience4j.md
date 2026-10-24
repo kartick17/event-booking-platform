@@ -6,11 +6,34 @@
 
 ---
 
-# PART A — Concepts
+## In plain English
+
+This phase keeps one slow or failing service from making the whole application wait. It adds limits and recovery rules around calls from booking-service to event-service.
+
+Imagine event-service takes 10 seconds to answer. Without limits, booking workers can all end up waiting. We need to stop waiting after a chosen time, avoid repeating hopeless calls, and leave workers available for other requests.
+
+Words used in this phase:
+
+- **Resilience:** continuing to handle work as well as possible when something fails.
+- **Dependency:** another service or tool this service needs.
+- **Timeout:** the limit on how long a call waits.
+- **Retry:** making another attempt after a failed call. Repeating a write is unsafe unless duplicates are handled.
+- **Backoff:** waiting between retry attempts. Exponential backoff increases that wait each time.
+- **Jitter:** adding a small random variation so clients do not all retry together.
+- **Circuit breaker:** temporarily stops new calls to a service with too many recent failures or slow calls.
+- **Fallback:** the response used when the usual operation cannot finish.
+- **Bulkhead:** a limit on how many calls may use one dependency at the same time.
+- **Rate limiter:** a limit on how many requests may start in a period of time.
+
+Start with the failure story in A1. For every tool, ask which part of that story it helps prevent.
+
+---
+
+# PART A — Understand the ideas
 
 ## A1. How one slow service kills a whole platform
 
-This story is why every pattern in this phase exists. Follow it slowly.
+Follow one slow call through the services. The tools in this phase each limit a different part of the resulting delay.
 
 ```
 Normal:
@@ -32,32 +55,23 @@ Traffic is still 500 requests/second:
   t+30s  the whole platform is down
 ```
 
-**Nothing crashed.** Every service is "up". `event-service` got slower, and slowness propagated
-backwards through everyone waiting on it.
+**A service can be running but unable to serve more requests.** Event-service slowed down, booking-service workers waited for it, and gateway requests then waited for booking-service.
 
-**The key insight: waiting is the failure mode.** A dependency that fails *instantly* is survivable —
-you return an error and free the thread. A dependency that takes 5 seconds consumes the one resource
-you cannot make more of.
+**Waiting uses capacity.** A failed call that ends quickly frees its worker quickly. A call that takes 5 seconds keeps that worker occupied. With enough such calls, new requests have no worker available.
 
-**Every pattern below is a way of not waiting.**
+The tools below limit waits, repeated attempts, or the number of calls affected.
 
 ## A2. Timeout — the foundation
 
-Already set in Phase 6, and worth restating as a principle: **an unbounded wait is an unbounded
-failure.** Every network call gets a timeout. Every one.
+Every network call needs a timeout. A caller must have a limit on how long it will wait, even if the other service never replies. Phase 6 configured these limits for Feign.
 
-**Choose it from your own budget, not from their average.** If your SLA is 2 seconds and you make two
-downstream calls, each gets under a second. A downstream timeout longer than your own response budget is
-meaningless — you have already failed by the time it fires.
+**Choose timeouts from the whole request budget.** If a request must finish in 2 seconds and makes two calls one after the other, each needs less than a second so there is time for the remaining work. **SLA** means an agreed service target; here, the target includes response time.
 
-**Resilience4j's `TimeLimiter`** exists on top of client timeouts because not every call is HTTP. It
-needs the call to run in a `CompletableFuture` so it can be cancelled from outside. For Feign, the
-client-level timeouts from Phase 6 are simpler and enough.
+`TimeLimiter` can limit waits for asynchronous work represented by a `CompletableFuture`. For our blocking Feign calls, use the HTTP client's connection and read timeouts from Phase 6. A timeout does not guarantee that work already started on another service has stopped.
 
 ## A3. Retry — useful and dangerous in equal measure
 
-Networks drop packets. A pod restarts. A brief GC pause. Many failures are **transient** — the same
-request a moment later succeeds.
+Some failures are temporary: a dropped connection, a service restarting, or a brief garbage-collection pause while Java cleans up memory. The same request may work a little later. This is when a retry can help.
 
 ### When retrying is wrong
 
@@ -71,15 +85,11 @@ POST /events/1/reserve?quantity=2
   → event-service reserves 2 MORE seats
 ```
 
-**Four seats gone for a two-seat booking.** Phase 6, concept A4: a timeout does not tell you whether the
-operation happened. **Retry is only safe when repeating the call is harmless** — which means `GET`,
-`PUT`, `DELETE` by nature, and `POST` only when you have made it idempotent (Phase 9).
+**The user asked for 2 seats, but 4 were reserved.** The first call may have succeeded even though its reply timed out. Retry only when repeating the operation has the same final effect. HTTP defines methods such as `GET`, `PUT`, and `DELETE` that way; a booking `POST` needs added duplicate protection from Phase 9.
 
 **2. 4xx errors.** The request is wrong. Retrying sends the identical wrong request.
 
-**3. When the service is genuinely down.** Retrying three times against a dead service triples the load
-on something already struggling and triples your own latency before failing anyway. That is what the
-circuit breaker is for.
+**3. A service that remains unavailable.** Repeating the call adds load and makes the caller wait longer. A circuit breaker can pause those calls while the service recovers.
 
 ### The retry storm
 
@@ -94,24 +104,19 @@ event-service hiccups for 1 second
   → 2000 more retries
 ```
 
-**Your retry policy turned a one-second hiccup into an outage.** The fixes:
+**Retries can turn a short problem into a longer outage.** Many clients repeating work together add more traffic just when a service is struggling. Use these limits:
 
-**Exponential backoff** — wait 100 ms, then 200 ms, then 400 ms. Gives the dependency room to recover.
+**Exponential backoff** increases the delay between attempts, for example 100 ms, then 200 ms, then 400 ms. It gives the other service time to recover.
 
-**Jitter** — randomise each wait. Without it, all 1000 clients retry at exactly `t+100ms`, then all at
-`t+300ms`. Synchronised retries are the storm. Jitter spreads them out and is the single most important
-part of a retry policy.
+**Jitter** adds random variation to each delay. Without it, many callers can retry at exactly the same times and overload the service again. Different delays spread those requests out.
 
-**A low attempt count.** Three total attempts, not ten. If three failed, the problem is not transient.
+**Keep the attempt count low.** This guide uses three total attempts. After repeated failure, return a clear failure rather than continuing to add load.
 
 ## A4. Circuit breaker
 
-Named after the electrical one: when current is dangerous, cut the circuit rather than let the house
-burn.
+An electrical circuit breaker cuts off current when there is a problem. The software version pauses calls when a service has too many failures or slow responses.
 
-**The idea:** if a dependency is failing, stop calling it. Fail instantly instead. You lose nothing —
-the call was going to fail anyway — and you gain everything: threads are freed, and the struggling
-service gets a chance to recover instead of being hammered.
+**The idea:** stop sending ordinary calls to a service that is repeatedly failing. Reject them quickly for a while. This frees callers and reduces pressure on the failing service while it recovers.
 
 ### Three states
 
@@ -132,17 +137,15 @@ CLOSED ────────────────────────�
                                           └──────▶ OPEN
 ```
 
-**CLOSED** — normal. Every result goes into a sliding window.
+**CLOSED** means calls are allowed. The breaker records recent results in a **sliding window**: a set of recent calls, or calls within a recent time period.
 
-**OPEN** — the breaker has tripped. Calls fail immediately with `CallNotPermittedException`, in
-microseconds. **No thread waits. No load reaches the sick service.**
+**OPEN** means new calls are rejected immediately with `CallNotPermittedException`. They do not reach the failing service, so workers do not wait for those calls.
 
-**HALF_OPEN** — after the wait, allow a few trial calls. All succeed → CLOSED. Any fails → OPEN again.
-This is how it recovers **automatically**, with no human and no restart.
+**HALF_OPEN** means a few test calls are allowed after the pause. Their results decide whether ordinary calls resume or the pause continues. This lets the breaker recover without a restart.
 
 ### The settings that matter
 
-| Setting | Meaning | Sensible value |
+| Setting | Meaning | Useful value |
 |---|---|---|
 | `slidingWindowSize` | how many calls (or seconds) are measured | 10–100 |
 | `failureRateThreshold` | % failures that trips it | 50% |
@@ -152,20 +155,16 @@ This is how it recovers **automatically**, with no human and no restart.
 | `slowCallDurationThreshold` | what counts as "slow" | your timeout, or lower |
 | `slowCallRateThreshold` | % slow calls that trips it | 50% |
 
-**`minimumNumberOfCalls` prevents a stupid failure:** without it, one failed call out of one is a 100%
-failure rate and the breaker opens on the very first hiccup at 3am when traffic is low.
+`minimumNumberOfCalls` requires enough results before judging the failure rate. Otherwise the very first failed call would be 1 failure out of 1 call, or 100%, and could open the breaker too early.
 
-**The slow-call settings are the ones most people skip, and they matter most.** Concept A1: slow kills
-you before failing does. A breaker that only counts *errors* will sit happily CLOSED while every call
-takes 5 seconds and your threads evaporate. **Counting slow calls as failures is what makes a circuit
-breaker actually protect you.**
+**Count slow calls as well as errors.** A service may return successful responses but take so long that callers run out of workers. The slow-call settings let the breaker react to that case too.
 
 ## A5. Fallback — and how to write an honest one
 
 When the breaker is open or the call fails, what do you return?
 
 **Good fallbacks:**
-- Cached or slightly stale data ("last known event details")
+- Cached or slightly out of date data ("last known event details")
 - A reduced response ("recommendations unavailable" but the page still renders)
 - A queued action ("we have received your request and will process it")
 - **A clear, correct error** — this is often the right answer
@@ -173,22 +172,18 @@ When the breaker is open or the call fails, what do you return?
 **Bad fallbacks, which are worse than failing:**
 - An empty list where the caller expects data — the user sees "no events" and believes it
 - A default that looks like real data — `availableSeats: 0` when you simply do not know
-- Silently swallowing the failure so nobody is alerted
+- Without a clear error swallowing the failure so nobody is alerted
 - **Anything that turns "I don't know" into "here is a fact"**
 
-**The rule: a fallback may degrade the answer, never falsify it.**
+**A fallback must be truthful.** It may return less data or a clear error. It must not present a guess as a confirmed result.
 
-For our booking flow the honest fallback is a clear error. We **cannot** invent event details, and we
-must never guess that seats are available. Booking with unknown inventory is the exact bug this whole
-project is about.
+For booking, a clear error is the useful fallback. If we cannot confirm seat availability, we cannot safely pretend a reservation succeeded.
 
 ## A6. Bulkhead
 
-From ships: a hull is divided into sealed compartments, so one breach floods one compartment rather
-than sinking the vessel.
+A ship has separate watertight sections so a leak affects only part of it. A software bulkhead applies a similar limit to shared workers or calls.
 
-**In software:** limit how many concurrent calls a single dependency may consume, so one sick dependency
-cannot eat the whole thread pool.
+**Limit calls to each dependency.** If event-service is slow, only a chosen number of workers may wait for it. Other workers remain available for other work.
 
 ```
 WITHOUT                              WITH
@@ -199,13 +194,10 @@ event-service                        180 threads still free for everything else
 ```
 
 Two kinds:
-- **Semaphore bulkhead** — a counter. The caller's own thread is used; over the limit, fail fast. Cheap;
-  our choice.
-- **Thread pool bulkhead** — a separate pool per dependency. Full isolation, but every call costs a
-  thread handoff and loses `ThreadLocal` context (`SecurityContextHolder`, MDC — Phase 2a and Phase 3).
+- **Semaphore bulkhead:** counts calls in progress. Calls use the caller's thread. Once the limit is reached, extra calls fail quickly. We use this type.
+- **Thread pool bulkhead:** runs the work on a separate set of threads. This separates workers but adds a thread switch. Values kept on the original thread, such as `SecurityContextHolder` and MDC, are not automatically carried across.
 
-**A bulkhead converts "everything is broken" into "this one feature is broken."** That is usually the
-difference between an incident and a page nobody notices.
+**A bulkhead limits how far a problem spreads.** One feature may fail while other features still have workers available.
 
 ## A7. The order the decorators run in
 
@@ -220,17 +212,12 @@ Retry
                  └─ your method
 ```
 
-**Read it as behaviour, because the order is not arbitrary:**
+**The wrappers run in a particular order.** Read the order as the path taken by each call:
 
-- **Retry is outermost**, so each retry attempt is a *separate* call through the circuit breaker. That
-  is what you want: three attempts against a dead service record three failures and help trip the
-  breaker.
-- **CircuitBreaker outside Bulkhead**, so when the breaker is open you fail without even taking a
-  bulkhead permit.
+- **Retry wraps the other checks.** Each new attempt passes through the circuit breaker, so each failed attempt can be counted separately.
+- **CircuitBreaker wraps Bulkhead.** An open breaker rejects a call before it takes one of the bulkhead's available places.
 
-**The consequence people get wrong:** `maxAttempts: 3` on retry combined with a breaker means a single
-user request can produce 3 recorded failures. Your `minimumNumberOfCalls` is counting *attempts*, not
-user requests. Size them together.
+**Count attempts, not just user requests.** With `maxAttempts: 3`, one request can add three failures to the breaker's record. Choose the retry and breaker settings together.
 
 ---
 
@@ -252,10 +239,7 @@ user requests. Size them together.
         </dependency>
 ```
 
-**`starter-aop` is not optional.** Resilience4j's annotations work through AOP proxies — the same
-mechanism as `@Transactional` and `@Cacheable`. Without it the annotations do nothing, silently. And
-**the self-invocation trap applies**: calling an annotated method from another method in the same class
-bypasses every protection. (Filters doc, AOP section.)
+**Include `starter-aop`.** These annotations use Spring-generated wrappers, just like `@Transactional` and `@Cacheable`. Without that support the protection is not applied. Calling an annotated method from another method on the same object also skips the wrapper. This is the self-invocation problem described in the filters guide.
 
 Move the version to a property in the root POM.
 
@@ -300,22 +284,15 @@ resilience4j:
 asked for event 999. `SeatsUnavailableException` means the event sold out. **Event-service is working
 perfectly in both cases.**
 
-**Get this wrong and you build a spectacular bug:** a popular sold-out event produces hundreds of
-`SeatsUnavailable` results, the breaker counts them as failures, trips, and now **nobody can book
-anything** — because one event sold out. The breaker must measure *the dependency's health*, never *the
-answers the dependency gives*.
+**A sold-out event is not evidence of a broken service.** If `SeatsUnavailable` counts as a dependency failure, one popular sold-out event could open the breaker and block unrelated bookings. Count service-health failures, not valid business rejections.
 
 The rest, briefly:
 
-- `COUNT_BASED` window of 10: the last 10 calls. `TIME_BASED` (the last N seconds) suits variable
-  traffic better; count-based is easier to reason about while learning.
-- `minimumNumberOfCalls: 5` — no judgement before five calls (concept A4).
-- `slowCallDurationThreshold: 1s` with `slowCallRateThreshold: 50` — **this is the setting that saves
-  you**. Concept A1: if half the calls take over a second, the breaker opens even though nothing has
-  technically failed.
-- `automaticTransitionFromOpenToHalfOpenEnabled: true` — move to HALF_OPEN on a timer instead of waiting
-  for the next call to arrive. Recovers without traffic.
-- `registerHealthIndicator: true` — the breaker's state appears in `/actuator/health`.
+- `COUNT_BASED` with 10 uses the last 10 calls. `TIME_BASED` uses calls within a recent number of seconds. Count-based is easier to inspect in this exercise.
+- `minimumNumberOfCalls: 5` waits for at least five calls before judging the rates.
+- `slowCallDurationThreshold: 1s` and `slowCallRateThreshold: 50` treat calls over 1 second as slow. If half the measured calls are slow, the breaker can open even if they returned successful responses.
+- `automaticTransitionFromOpenToHalfOpenEnabled: true` moves to the test-call state after the configured delay without needing a new ordinary call to trigger it.
+- `registerHealthIndicator: true` includes the breaker state in `/actuator/health`.
 
 ## Step 3 — Retry and bulkhead
 
@@ -368,13 +345,9 @@ worst case added latency: ~900 ms
 **`enableRandomizedWait: true` is the jitter from concept A3** — the line that prevents a retry storm.
 Never ship a retry policy without it.
 
-**Notice the instance is named `eventServiceRead`.** That naming is deliberate and it is the heart of
-this step: **we will apply retry only to `getEvent`, never to `reserveSeats`.** Reads are idempotent;
-reserving seats is not. Concept A3 — retrying a reserve after a timeout books extra seats.
+**`eventServiceRead` applies retry only to `getEvent`.** Reading details can be repeated without reserving more seats. Do not apply the same retry to `reserveSeats`: a timed-out attempt may already have reserved them.
 
-**`maxWaitDuration: 0` on the bulkhead**: when 20 calls are already in flight, the 21st fails
-immediately rather than queueing. **Queueing to enter a bulkhead defeats its purpose** — you would be
-waiting again, which is the thing you are trying to stop.
+**`maxWaitDuration: 0` means no queue for this bulkhead.** With 20 calls already running, the 21st is rejected immediately. Waiting for a place would keep another caller occupied, which this limit is intended to avoid.
 
 ## Step 4 — Expose the state
 
@@ -463,10 +436,7 @@ nothing.
 - Any mismatch fails at **runtime**, not compile time, with a confusing message. Get it wrong once
   deliberately so you recognise it later.
 
-**Our fallback throws rather than returning fake data.** Concept A5: we cannot invent an event, and
-returning `availableSeats: 0` would be a lie that causes a wrong booking decision. **The fallback's job
-here is to convert an ugly failure into a clear, honest one** — a friendly message and a 503 instead of
-a stack trace.
+**The fallback throws a clear service-unavailable error.** It does not invent an event or return `availableSeats: 0` when the real value is unknown. That gives the client a useful 503 response without claiming a false booking result.
 
 **The write path, deliberately different:**
 
@@ -486,13 +456,10 @@ a stack trace.
 
 **No `@Retry`. No fallback. This is the most important decision in the phase.**
 
-**No retry**, because reserving seats is not idempotent (concept A3). A timeout leaves us genuinely
-unsure whether the seats were taken; retrying risks taking them twice. **When you cannot tell, do not
-repeat.** Phase 9 makes these operations idempotent, and *then* retry becomes safe — that ordering is
-the whole point.
+**Do not retry reservations yet.** A timeout may hide a successful reservation, so another attempt could reserve the seats twice. First make repeated writes safe using the duplicate protection introduced in Phase 9.
 
 **No fallback**, because there is no honest degraded answer to "did the reservation happen?" Failing
-loudly is correct. **A fallback that pretends a write succeeded is how systems silently lose data.**
+loudly is correct. **A fallback that pretends a write succeeded is how systems without a clear error lose data.**
 
 Then change `BookingService` to depend on `EventGateway` instead of `EventClient`. Nothing else in it
 changes — the resilience policy is invisible to the business logic, which is exactly right.
@@ -582,9 +549,7 @@ curl -s http://localhost:8083/actuator/retryevents | jq '.retryEvents[-5:]'
 **Look at the gaps between the timestamps** — around 200 ms then around 400 ms, each randomised. That is
 exponential backoff with jitter, in your own data.
 
-**Now the cost.** That single user request took ~2.9 s (three 1-second connect timeouts plus the
-waits). **Retry makes a failing request slower**, and that is exactly why the circuit breaker sits
-outside it: once the breaker opens, retry never runs at all.
+**Retries add delay to a failing request.** Several connection waits and pauses can make this request take roughly 3 seconds. In the wrapper order described in A7, each attempt passes through the circuit breaker. An open breaker rejects attempts quickly rather than sending them to the failed service.
 
 ### Drill 2 — the sold-out disaster
 
@@ -625,7 +590,7 @@ actually kills systems.** Remember the sleep and put the settings back.
 
 ### Drill 4 — the bulkhead holds a line
 
-With the 2-second sleep still in place, fire 50 concurrent bookings:
+With the 2-second sleep still in place, fire 50 happening at the same time bookings:
 
 ```bash
 for i in $(seq 1 50); do
@@ -637,9 +602,7 @@ done; wait; echo
 
 At most 20 are in flight against event-service; the rest fail instantly with a bulkhead rejection.
 
-**Meanwhile, `GET /api/v1/bookings` still responds normally.** That is the compartment holding: one sick
-dependency degraded one feature, and the rest of the service kept working. Without the bulkhead, all 50
-would have occupied threads and "my bookings" would have hung too.
+**`GET /api/v1/bookings` should still work.** The limited number of calls waiting for event-service leaves workers available for reading existing bookings. The test shows whether one slow dependency stays limited to the affected feature.
 
 ### Drill 5 — the reason we did not retry writes
 
@@ -671,13 +634,13 @@ the first time you meet this in production you will already know the cause.
 
 | Mistake | Symptom | Fix |
 |---|---|---|
-| Missing `starter-aop` | Annotations silently do nothing | Add the dependency |
+| Missing `starter-aop` | Annotations without a clear error do nothing | Add the dependency |
 | Annotated method called from the same class | Protections skipped | AOP self-invocation — call through another bean |
 | Business exceptions in `recordExceptions` | One sold-out event kills all bookings | `ignoreExceptions` |
 | No slow-call threshold | Breaker never opens while threads die | Set both slow-call settings |
 | Retry on non-idempotent writes | Duplicate reservations | Reads only, until Phase 9 |
 | Retry with no jitter | Synchronised retry storm | `enableRandomizedWait: true` |
-| `maxAttempts: 10` | Long latency, more load on a sick service | 3 |
+| `maxAttempts: 10` | Long time taken to get a response, more load on a sick service | 3 |
 | `minimumNumberOfCalls: 1` | Opens on a single blip | 5–10 |
 | Fallback returning fake data | Silent wrong answers | Degrade, never falsify |
 | Fallback swallowing everything | Outages become invisible | Log and alert |
@@ -687,22 +650,16 @@ the first time you meet this in production you will already know the cause.
 
 ---
 
-## Production considerations
+## Notes for a real running system
 
-- **Alert on `STATE_TRANSITION` to OPEN.** An open breaker is a real incident; without an alert it is a
-  silent degradation nobody sees.
-- **Export the metrics** (Micrometer → Prometheus). Failure rate and slow-call rate per dependency are
-  the first graphs you will want.
-- **Tune with real data.** Every number in this file is a starting guess. Watch p99 latency and set
-  `slowCallDurationThreshold` from it.
-- **Different policies per dependency.** A payment gateway is not a recommendation service.
-- **Client-side rate limiting** (`resilience4j.ratelimiter`) when a downstream service has quotas — be a
-  good citizen before they throttle you.
-- **Timeouts remain the foundation.** Resilience4j cannot protect you from a call that never returns.
-- **Test failures in CI** with Testcontainers + Toxiproxy (Phase 13), so resilience config is verified
-  rather than assumed.
-- **Graceful degradation is a product decision.** "Show cached events with a stale banner" is a design
-  conversation, not something to invent in a `catch` block.
+- **Alert when the breaker changes to OPEN**, including a `STATE_TRANSITION` event. It signals repeated failures or slow calls.
+- **Collect measurements** through Micrometer and Prometheus. Start with failure rate and slow-call rate for each dependency.
+- **Tune settings using measurements.** **p99 response time** is the time within which 99% of measured calls finish. It can help choose `slowCallDurationThreshold`.
+- **Choose rules per dependency.** Payment processing and optional recommendations have different failure costs.
+- **Use client rate limits** through `resilience4j.ratelimiter` when a called service limits allowed traffic.
+- **Keep client timeouts.** A circuit breaker does not by itself stop every call already waiting.
+- **Test failures in CI** with Testcontainers and Toxiproxy, as described in Phase 13.
+- **Agree on fallback behaviour with the product needs.** Showing an old cached event with a clear notice can be useful; silently inventing data cannot.
 
 ---
 
