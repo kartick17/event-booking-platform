@@ -5,6 +5,8 @@ import com.eventbooking.event.api.dto.EventResponse;
 import com.eventbooking.event.api.dto.PageResponse;
 import com.eventbooking.event.application.EventService;
 import jakarta.validation.Valid;
+import jakarta.validation.constraints.Max;
+import jakarta.validation.constraints.Min;
 import lombok.AllArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.data.domain.Pageable;
@@ -63,5 +65,17 @@ public class EventController {
     @PreAuthorize("hasRole('ADMIN')")
     public EventResponse cancel(@PathVariable Long id) {
         return EventResponse.from(eventService.cancel(id));
+    }
+
+    @PostMapping("/{id}/reserve")
+    @PreAuthorize("isAuthenticated()")
+    public EventResponse reserve(@PathVariable Long id, @RequestParam @Min(1) @Max(10) int quantity) {
+        return EventResponse.from(eventService.reserveSeats(id, quantity));
+    }
+
+    @PostMapping("/{id}/release")
+    @PreAuthorize("isAuthenticated()")
+    public EventResponse release(@PathVariable Long id, @RequestParam @Min(1) @Max(10) int quantity) {
+        return EventResponse.from(eventService.releaseSeats(id, quantity));
     }
 }

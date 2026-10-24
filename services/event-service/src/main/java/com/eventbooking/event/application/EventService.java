@@ -126,7 +126,11 @@ public class EventService {
         return event;
     }
 
-    @Transactional Event releaseSeats(Long eventId, int quantity) {
-        
+    @Transactional
+    public Event releaseSeats(Long eventId, int quantity) {
+        Event event = getById(eventId);
+        event.releaseSeats(quantity);
+        log.info("Released {} seats on event {} - {} remaining", quantity, eventId, event.getAvailableSeats());
+        return event;
     }
 }
