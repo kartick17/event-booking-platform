@@ -5,6 +5,7 @@ Read in order. Each phase doc is self-contained: concepts first, then build it s
 ## Start here
 
 - [00 — Roadmap & Architecture](00-roadmap-and-architecture.md)
+- [Revise Phases 1–5 through your existing code](revision-guide.md) — small lessons and real practice before continuing Phase 6.
 
 ## Phases
 
